@@ -105,40 +105,112 @@ def main():
         set_random_seed(seed, deterministic=args.deterministic)
     cfg.seed = seed
 
-    # 1. 构建 FP32 模型
+   # =============================================================================
+    # Step 1: 构建 FP32 模型
+    # =============================================================================
     model = build_model(cfg.model)
     model.init_weights()
 
-    # 2. 加载 FP32 权重 (Fix Bug 3)
-    fp32_ckpt = cfg.get('load_from_fp32', None)
+    # =============================================================================
+    # Step 2: 加载 FP32 权重 (必须在量化前完成，TACQ 依赖它计算梯度)
+    # =============================================================================
+    # 优先使用 load_from_fp32，如果没有，则回退使用标准的 load_from
+    fp32_ckpt = cfg.get('load_from_fp32', None) or cfg.get('load_from', None)
+    
     if fp32_ckpt:
-        logger.info(f"Loading FP32 weights from {fp32_ckpt} ...")
+        logger.info(f"Loading FP32 weights from {fp32_ckpt} for initialization/calibration ...")
+        # strict=False 允许加载时有一些不匹配（通常用于微调）
         load_checkpoint(model, fp32_ckpt, map_location='cpu', strict=False, logger=logger)
     elif args.load_task_pretrain:
         if hasattr(model, 'load_task_pretrain'):
+            logger.info("Loading task pretrained weights via model.load_task_pretrain() ...")
             model.load_task_pretrain()
-
-    # 3. 应用量化
-    if cfg.get('quantize', False):
-        logger.info("Applying TSQ-MTC Quantization...")
-        if hasattr(model, 'apply_quantization'):
-            model.apply_quantization(num_tasks=3)
-        elif hasattr(model, 'module') and hasattr(model.module, 'apply_quantization'):
-            model.module.apply_quantization(num_tasks=3)
-        
-        if cfg.get('load_from'):
-            logger.info(f"Resuming QAT from {cfg.load_from} ...")
-            load_checkpoint(model, cfg.load_from, map_location='cpu', logger=logger)
     else:
-        if cfg.get('load_from'):
-            load_checkpoint(model, cfg.load_from, map_location='cpu', logger=logger)
+        logger.warning("Warning: No pretrained weights loaded! TACQ calibration will be random if quantize=True.")
 
+    # =============================================================================
+    # Step 3: 构建数据集 (必须在量化前构建，TACQ 需要校准数据)
+    # =============================================================================
+    logger.info("Building datasets...")
     datasets = build_datasets(cfg.data)
+    
+    # 设置类别名
     CLASSES = {name: dataset.CLASSES for name, dataset in datasets.items()}
     model.CLASSES = CLASSES
 
+    # =============================================================================
+    # Step 4: 应用量化策略 (TACQ 混合精度 或 标准均匀量化)
+    # =============================================================================
+    if cfg.get('quantize', False):
+        logger.info("准备进行 TACQ 混合精度量化初始化...")
+        
+        # 1. 获取校准数据集 (取第一个 key)
+        # 此时 datasets 已经定义，可以安全使用了
+        dataset_keys = list(datasets.keys())
+        calib_dataset_name = dataset_keys[0]
+        calib_dataset = datasets[calib_dataset_name]
+        
+        # 2. 自动推断任务类型
+        target_task = 'cls' # 默认值
+        if 'resisc' in calib_dataset_name.lower():
+            target_task = 'cls'
+        elif 'dior' in calib_dataset_name.lower():
+            target_task = 'det'
+        elif 'potsdam' in calib_dataset_name.lower():
+            target_task = 'seg'
+        
+        logger.info(f"Selected calibration dataset: {calib_dataset_name}, Task: {target_task}")
+
+        # 3. 修复 GroupSampler 问题
+        if not hasattr(calib_dataset, 'flag'):
+            import numpy as np
+            calib_dataset.flag = np.zeros(len(calib_dataset), dtype=np.int64)
+
+        # 4. 构建 Loader
+        from mmdet.datasets import build_dataloader
+        calib_loader = build_dataloader(
+            calib_dataset,
+            samples_per_gpu=2,
+            workers_per_gpu=0,
+            dist=False,
+            shuffle=True
+        )
+        
+        # 5. 调用混合精度初始化
+        # 优先尝试混合精度，如果没有该方法则回退到普通量化
+        if hasattr(model, 'apply_mixed_precision_quantization'):
+            model.apply_mixed_precision_quantization(
+                data_loader=calib_loader, 
+                num_tasks=3, 
+                ratio_8bit=0.5,
+                default_task=target_task
+            )
+        elif hasattr(model, 'module') and hasattr(model.module, 'apply_mixed_precision_quantization'):
+            model.module.apply_mixed_precision_quantization(
+                data_loader=calib_loader, 
+                num_tasks=3, 
+                ratio_8bit=0.5,
+                default_task=target_task
+            )
+        else:
+            # 回退逻辑
+            logger.info("Applying Standard TSQ-MTC Quantization (Uniform)...")
+            if hasattr(model, 'apply_quantization'):
+                model.apply_quantization(num_tasks=3)
+            elif hasattr(model, 'module'):
+                model.module.apply_quantization(num_tasks=3)
+        
+        # 6. 加载 QAT 权重 (仅当这是 Resume 训练时)
+        # 如果是首次从 FP32 转 QAT，这一步是不需要的，因为已经在 Step 2 加载了 FP32 权重
+        # 只有当你中断了 QAT 训练，想继续训练时，才需要这里加载
+        if cfg.get('resume_from'): # 注意：通常是用 resume_from 而不是 load_from 来区分
+             logger.info(f"Resuming QAT training from {cfg.resume_from} ...")
+             # load_checkpoint(model, cfg.resume_from, ...) # runner 会自动处理 resume，这里其实可以省略
+
+    # =============================================================================
+    # Step 5: 开始训练
+    # =============================================================================
     if not hasattr(cfg, 'device'):
-        # 如果配置文件中没有指定 device，默认使用 'cuda'（如果可用）或 'cpu'
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     train_model(

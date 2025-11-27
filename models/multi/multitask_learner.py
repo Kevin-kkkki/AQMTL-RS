@@ -26,6 +26,45 @@ try:
 except ImportError:
     MMDETLinear = None
 
+
+# --- [新增] 辅助函数：计算单层的 TACQ 重要性分数 ---
+def compute_tacq_layer_score(module, nbits_probe=4):
+    """
+    计算层的 TACQ 重要性分数。
+    TACQ Score = Mean( |W| * |Grad| * |Q(W) - W| )
+    """
+    # 1. 基础检查
+    if not hasattr(module, 'weight') or module.weight is None:
+        return 0.0
+    if module.weight.grad is None:
+        # 如果没有梯度，说明该层在反向传播中未被激活或被冻结，重要性视为0
+        return 0.0
+
+    w = module.weight.data
+    grad = module.weight.grad.data
+    
+    # 2. 模拟量化误差 (Estimation of Quantization Error)
+    # 既然我们在做 4-bit vs 8-bit 的决策，我们用 4-bit 的扰动来探测敏感度
+    # 使用简单的 MinMax 对称量化来估算
+    Qn = -2 ** (nbits_probe - 1)
+    Qp = 2 ** (nbits_probe - 1) - 1
+    
+    # 计算缩放因子 (Per-tensor 或 Per-channel 均可，这里用 Per-tensor 简化估计)
+    scale = w.abs().max() / Qp
+    # 避免除零
+    scale = torch.max(scale, torch.tensor(1e-8, device=w.device))
+    
+    w_quant = (w / scale).round().clamp(Qn, Qp) * scale
+    quant_err = (w_quant - w).abs()
+
+    # 3. 计算 TACQ Metric: |W| * |Grad| * |Quant_Err|
+    saliency_map = w.abs() * grad.abs() * quant_err
+    
+    # 4. 聚合为层级分数 (使用平均值)
+    layer_score = saliency_map.mean().item()
+    
+    return layer_score
+
 def add_prefix(log_dict, prefix):
     return {f'{prefix}.{k}': v for k, v in log_dict.items()}
 
@@ -71,32 +110,136 @@ class MTL(BaseModule):
             if hasattr(module, 'change_buffer'):
                 module.change_buffer(task_id)
 
-    def apply_quantization(self, num_tasks=3, nbits_w=4, nbits_a=4):
-        print_log(f"正在应用 TSQ-MTC 量化 (Task Buffer Mode, tasks={num_tasks})...", logger='root')
-        def _replace_layers(module, num_tasks, nbits_w, nbits_a):
-            for name, child in module.named_children():
+    def apply_mixed_precision_quantization(self, data_loader, num_tasks=3, ratio_8bit=0.5, default_task='cls'):
+        """
+        基于 TACQ 的混合精度量化策略 (Layer-wise Mixed Precision)。
+        Args:
+            data_loader: 校准数据加载器
+            num_tasks: 任务数
+            ratio_8bit: 8-bit 层比例
+            default_task: 校准数据对应的任务类型 ('cls', 'det', 'seg') <--- 新增参数
+        """
+        print_log(f"正在启动 TACQ 混合精度策略 (Top {ratio_8bit*100}% Layers -> 8-bit)...", logger='root')
+        
+        # 1. 定义黑名单
+        skip_keywords = [
+            'fc_reg', 'fc_cls', 'bbox_pred', 'cls_score', 'mask_embed', 'cls_head.fc',
+            'patch_embed', 'absolute_pos_embed', 'pos_embed', 'backbone.stem'
+        ]
+
+        # 2. 收集梯度
+        print_log("Step 1/3: 利用校准数据计算梯度...", logger='root')
+        self.eval()
+        self.zero_grad()
+        
+        calibration_batches = 2
+        
+        try:
+            for i, data in enumerate(data_loader):
+                if i >= calibration_batches: break
+                
+                # --- [Fix] 手动注入 task 参数 ---
+                if 'task' not in data:
+                    data['task'] = default_task
+                # ------------------------------
+
+                with torch.enable_grad():
+                    losses = self(**data)
+                    loss, _ = self._parse_losses(losses)
+                    loss.backward()
+            
+            print_log("梯度计算完成。", logger='root')
+            
+        except Exception as e:
+            print_log(f"Error during gradient calibration: {e}", logger='root')
+            print_log("CRITICAL: Calibration failed. Please check data loader.", logger='root')
+            return 
+            # 注意：如果你已经删除了 apply_quantization 方法，不要在这里调用它，否则会报 AttributeError
+
+        # 3. 计算分数
+        print_log("Step 2/3: 计算层重要性并分配位宽...", logger='root')
+        layer_scores = {}
+        quantizable_layers = []
+
+        for name, module in self.named_modules():
+            if any(k in name for k in skip_keywords): continue
+            
+            if isinstance(module, (nn.Conv2d, nn.Linear, MMDETLinear if MMDETLinear else nn.Linear)):
+                score = compute_tacq_layer_score(module, nbits_probe=4)
+                layer_scores[name] = score
+                quantizable_layers.append(name)
+        
+        # 排序与分配
+        sorted_layers = sorted(layer_scores.items(), key=lambda x: x[1], reverse=True)
+        num_8bit = int(len(quantizable_layers) * ratio_8bit)
+        layers_8bit_set = set([x[0] for x in sorted_layers[:num_8bit]])
+        
+        if sorted_layers:
+            print_log(f"Top-1 Sensitive Layer: {sorted_layers[0][0]}", logger='root')
+
+        self.zero_grad()
+
+        # 4. 执行替换
+        print_log("Step 3/3: 替换网络层...", logger='root')
+        
+        def _replace_layers_mixed(module, num_tasks, parent_name=''):
+            for name, child in list(module.named_children()):
+                full_name = f"{parent_name}.{name}" if parent_name else name
+                
+                if any(k in name for k in skip_keywords): continue
+
+                current_w_bits = 8 if full_name in layers_8bit_set else 4
+                current_a_bits = 4 
+
                 if (isinstance(child, nn.Linear) or (MMDETLinear and isinstance(child, MMDETLinear))) \
                    and not isinstance(child, LinearLSQ):
                     new_linear = LinearLSQ(child.in_features, child.out_features, child.bias is not None, 
-                        num_tasks=num_tasks, nbits_w=nbits_w, nbits_a=nbits_a)
+                        num_tasks=num_tasks, nbits_w=current_w_bits, nbits_a=current_a_bits)
                     new_linear.load_state_dict(child.state_dict(), strict=False)
                     setattr(module, name, new_linear)
+                
                 elif isinstance(child, nn.Conv2d) and not isinstance(child, Conv2dLSQ):
                     new_conv = Conv2dLSQ(child.in_channels, child.out_channels, child.kernel_size,
                         child.stride, child.padding, child.dilation, child.groups, child.bias is not None, 
-                        num_tasks=num_tasks, nbits_w=nbits_w, nbits_a=nbits_a)
+                        num_tasks=num_tasks, nbits_w=current_w_bits, nbits_a=current_a_bits)
                     new_conv.load_state_dict(child.state_dict(), strict=False)
                     setattr(module, name, new_conv)
                 
-                # --- [核心修复] 使用 QuantActLSQ 替换 ReLU，找回非线性 ---
                 elif isinstance(child, (nn.ReLU, nn.GELU)) and not isinstance(child, ActLSQ):
-                    new_act = QuantActLSQ(activation_cls=type(child), in_features=1, num_tasks=num_tasks, nbits_a=nbits_a)
+                    new_act = QuantActLSQ(activation_cls=type(child), in_features=1, num_tasks=num_tasks, nbits_a=current_a_bits)
                     setattr(module, name, new_act)
-                # --------------------------------------------------
+                
                 else:
-                    _replace_layers(child, num_tasks, nbits_w, nbits_a)
-        _replace_layers(self, num_tasks, nbits_w, nbits_a)
-        print_log("量化层替换完毕，FP32权重已复制。", logger='root')
+                    _replace_layers_mixed(child, num_tasks, full_name)
+
+        _replace_layers_mixed(self, num_tasks)
+        print_log("混合精度量化初始化完成。", logger='root')
+    # def apply_quantization(self, num_tasks=3, nbits_w=4, nbits_a=4):
+    #     print_log(f"正在应用 TSQ-MTC 量化 (Task Buffer Mode, tasks={num_tasks})...", logger='root')
+    #     def _replace_layers(module, num_tasks, nbits_w, nbits_a):
+    #         for name, child in module.named_children():
+    #             if (isinstance(child, nn.Linear) or (MMDETLinear and isinstance(child, MMDETLinear))) \
+    #                and not isinstance(child, LinearLSQ):
+    #                 new_linear = LinearLSQ(child.in_features, child.out_features, child.bias is not None, 
+    #                     num_tasks=num_tasks, nbits_w=nbits_w, nbits_a=nbits_a)
+    #                 new_linear.load_state_dict(child.state_dict(), strict=False)
+    #                 setattr(module, name, new_linear)
+    #             elif isinstance(child, nn.Conv2d) and not isinstance(child, Conv2dLSQ):
+    #                 new_conv = Conv2dLSQ(child.in_channels, child.out_channels, child.kernel_size,
+    #                     child.stride, child.padding, child.dilation, child.groups, child.bias is not None, 
+    #                     num_tasks=num_tasks, nbits_w=nbits_w, nbits_a=nbits_a)
+    #                 new_conv.load_state_dict(child.state_dict(), strict=False)
+    #                 setattr(module, name, new_conv)
+                
+    #             # --- [核心修复] 使用 QuantActLSQ 替换 ReLU，找回非线性 ---
+    #             elif isinstance(child, (nn.ReLU, nn.GELU)) and not isinstance(child, ActLSQ):
+    #                 new_act = QuantActLSQ(activation_cls=type(child), in_features=1, num_tasks=num_tasks, nbits_a=nbits_a)
+    #                 setattr(module, name, new_act)
+    #             # --------------------------------------------------
+    #             else:
+    #                 _replace_layers(child, num_tasks, nbits_w, nbits_a)
+    #     _replace_layers(self, num_tasks, nbits_w, nbits_a)
+    #     print_log("量化层替换完毕，FP32权重已复制。", logger='root')
 
     # ... (init_weights, extract_feat 等保持你之前的修复版，一定要保留 [-3:] 切片) ...
     # 为节省篇幅，以下函数保持不变，请确保你用了之前修复好的版本：
@@ -261,17 +404,44 @@ class MTL(BaseModule):
     def load_task_pretrain(self): pass
     
     @auto_fp16(apply_to=('img',))
-    def forward(self, task, img, img_metas, return_loss=True, dataset_name=None, **kwargs):
+    def forward(self, task, img, img_metas, return_loss=True,
+                dataset_name=None, **kwargs):
         if torch.onnx.is_in_onnx_export():
             assert len(img_metas) == 1
             return self.onnx_export(img[0], img_metas[0])
-        if self.quantize:
+
+        # ================== 【新增/修改的代码】 ==================
+        # 1. 优先处理 task 是 list 的情况 (解包)
+        # 测试时 DataLoader 会把 string 包装成 list，例如 ['cls']
+        if isinstance(task, list):
+            # 简单取第一个元素，因为这里假设 batch 内任务一致
+            task = task[0] 
+        
+        # 2. 再执行量化任务切换逻辑
+        if getattr(self, 'quantize', False):
+            # 现在的 task 已经是 string 了，可以用作 key
             task_id = self.task_map[task]
             self.set_task(task_id)
+        # ========================================================
+
         if return_loss:
-            return self.forward_train(task=task, img=img, img_metas=img_metas, **kwargs)
+            return self.forward_train(
+                task=task, img=img, img_metas=img_metas, **kwargs)
         else:
-            return self.forward_test(task=task, img=img, img_metas=img_metas, **kwargs)
+            return self.forward_test(
+                task=task, img=img, img_metas=img_metas, **kwargs)
+    # @auto_fp16(apply_to=('img',))
+    # def forward(self, task, img, img_metas, return_loss=True, dataset_name=None, **kwargs):
+    #     if torch.onnx.is_in_onnx_export():
+    #         assert len(img_metas) == 1
+    #         return self.onnx_export(img[0], img_metas[0])
+    #     if self.quantize:
+    #         task_id = self.task_map[task]
+    #         self.set_task(task_id)
+    #     if return_loss:
+    #         return self.forward_train(task=task, img=img, img_metas=img_metas, **kwargs)
+    #     else:
+    #         return self.forward_test(task=task, img=img, img_metas=img_metas, **kwargs)
 
 
 # import warnings

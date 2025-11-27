@@ -1,49 +1,42 @@
+import sys
+import os.path as osp
+
+# 1. 路径修复
+project_root = osp.dirname(osp.dirname(osp.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import argparse
 import os
 import os.path as osp
 import sys
-from functools import partial 
 import warnings
 import torch
-from mmcv import Config, DictAction, ConfigDict
+from mmcv import Config, DictAction
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import load_checkpoint
-from mmdet.apis import single_gpu_test # 需要它来模拟测试循环
 from mmdet.datasets import build_dataloader
 from mmdet.models import build_detector
 from typing import List
 
 # --- 1. 路径与注册修复 (HARD FIX) ---
-# 确保项目根目录 (RSCoTr-master) 被加入到 Python 搜索路径中
 project_root = osp.dirname(osp.dirname(osp.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-# ------------------------------------
 
-# --- 2. 导入项目内部模块（必须在路径修复后）---
-# 导入数据构建器
+# --- 2. 导入项目内部模块 ---
 try:
     from mtl.data.build import build_datasets 
-except ModuleNotFoundError:
-    # 如果环境设置正确，这个异常不会被触发
-    raise ModuleNotFoundError("CRITICAL ERROR: Failed to import mtl.data.build. Check your project structure or Python path setup.")
-    
-# 导入模型注册模块 (触发模型注册)
-try:
+    # 显式导入模型以触发注册
     import models.multi.multitask_learner
     import models.multi.cls_head.slvl_cls_head
     import models.multi.bbox_head.dino_head
     import models.multi.seg_head.mask2former_head
 except ImportError as e:
-    print(f"Warning: Explicit model import failed: {e}")
-# ---------------------------------------------
+    print(f"Warning: Import failed or modules already loaded: {e}")
 
-# --- 2. 【核心修复】 自定义测试函数来注入 task 参数 ---
+# --- 自定义测试 Runner ---
 def custom_test_runner(model, data_loader, task_name, show=False, out_dir=None):
-    """
-    功能：模拟 single_gpu_test 流程，但手动注入 task 参数给 model.forward
-    """
-    # 修复 eval 属性缺失
     model_to_eval = model.module if hasattr(model, 'module') else model
     model_to_eval.eval() 
     
@@ -53,39 +46,46 @@ def custom_test_runner(model, data_loader, task_name, show=False, out_dir=None):
     
     for i, data in enumerate(data_loader):
         with torch.no_grad():
-            # 注入 task_name 到 data 字典
             data['task'] = task_name 
-            
-            # MMDataParallel 会将 data dict 解包并传给 self.module.forward(**data)
-            # outputs = model(return_loss=False, rescale=True, **data)
-            
-            # [修正] 确保 model(task, img, img_metas, ...) 调用的参数顺序正确
-            # DataParallel 接收 *inputs, **kwargs，但 model.forward 是 (task, img, img_metas, ...)
-            # 经过 MMDataParallel 封装，我们只需确保 model(**data) 包含所有键
+            # forward_test
             outputs = model(return_loss=False, rescale=True, **data)
-
-        # 结果处理
         results.extend(outputs)
         prog_bar.update(len(data['img_metas']))
-
     return results
-# ----------------------------------------------------
 
-# --- 3. 评估指标筛选器 ---
+# --- 指标筛选器 (修复了 args 作用域问题) ---
 def get_task_metrics(task_type: str, eval_args: List[str]):
-    """根据任务类型，从 eval_args 中筛选出正确的指标。"""
+    if not eval_args:
+        return None
+        
     lower_args = [m.lower() for m in eval_args]
+    
     if task_type == 'cls':
-        metrics = [m for m in lower_args if 'accuracy' in m or 'top' in m]
+        # 分类通常使用 'accuracy' (小写)
+        metrics = []
+        if any('acc' in m for m in lower_args):
+            metrics.append('accuracy')
+        if any('top' in m for m in lower_args):
+             if 'accuracy' not in metrics: metrics.append('accuracy')
         return metrics if metrics else ['accuracy']
-    elif task_type == 'det':
-        metrics = [m for m in lower_args if 'bbox' in m]
-        return metrics if metrics else ['bbox']
-    elif task_type == 'seg':
-        metrics = [m for m in lower_args if 'miou' in m or 'fscore' in m]
-        return metrics if metrics else ['mIoU']
-    return args.eval 
 
+    elif task_type == 'det':
+        # 检测使用 'bbox' (小写)
+        metrics = []
+        if any('bbox' in m for m in lower_args) or any('map' in m for m in lower_args):
+            metrics.append('bbox')
+        return metrics if metrics else ['bbox']
+
+    elif task_type == 'seg':
+        # 【关键修复】 分割必须返回 'mIoU', 'mFscore' (注意大小写)
+        metrics = []
+        if any('iou' in m for m in lower_args):
+            metrics.append('mIoU')     # <--- 必须是 mIoU
+        if any('fscore' in m for m in lower_args):
+            metrics.append('mFscore')  # <--- 必须是 mFscore
+        return metrics if metrics else ['mIoU']
+        
+    return eval_args
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MMDet test (and eval) a model')
@@ -94,9 +94,7 @@ def parse_args():
     parser.add_argument('--out', help='output result file in pickle format')
     parser.add_argument('--show', action='store_true', help='show results')
     parser.add_argument('--show-dir', help='directory where painted images will be saved')
-    parser.add_argument('--show-score-thr', type=float, default=0.3, help='score threshold (default: 0.3)')
     parser.add_argument('--eval', type=str, nargs='+', help='evaluation metrics')
-    parser.add_argument('--options', nargs='+', action=DictAction)
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
     parser.add_argument('--local_rank', type=int, default=0)
     args = parser.parse_args()
@@ -117,6 +115,7 @@ def main():
     cfg.model.pretrained = None
 
     # 1. 构建模型
+    print(f"Building model from config...")
     model = build_detector(cfg.model, train_cfg=None, test_cfg=cfg.get('test_cfg'))
     
     # 2. 应用量化结构
@@ -126,23 +125,42 @@ def main():
             model.apply_quantization(num_tasks=3)
         elif hasattr(model, 'module') and hasattr(model.module, 'apply_quantization'):
             model.module.apply_quantization(num_tasks=3)
-        print("[Test] Quantization layers applied. Ready to load QAT weights.\n")
+        print("[Test] Quantization layers applied.")
     
-    # 3. 加载 QAT 权重
+    # 3. 加载权重
     print(f"[Test] Loading checkpoint from {args.checkpoint}...")
     load_checkpoint(model, args.checkpoint, map_location='cpu')
 
-    # 4. 构建数据集和 DataParallel
+    # 4. DataParallel
     model = MMDataParallel(model, device_ids=[0])
+    
+    # 5. 构建数据集
+    # 注意：build_datasets 返回的是 {dataset_name: dataset_obj}
     datasets_dict = build_datasets(cfg.data, split='test')
     
-    # 5. 循环测试每个任务
+    # 6. 循环测试每个任务
     for dataset_name, dataset in datasets_dict.items():
         print(f"\n\n{'='*20} Testing Task: {dataset_name} {'='*20}")
         
-        # 修复：安全地提取 workers_per_gpu 的值
+        # 获取任务类型 (cls/det/seg)
+        # 如果 dataset 对象没有 task 属性，尝试从名字推断作为兜底
+        if hasattr(dataset, 'task'):
+            task_type = dataset.task
+        else:
+            if 'resisc' in dataset_name: task_type = 'cls'
+            elif 'dior' in dataset_name: task_type = 'det'
+            elif 'potsdam' in dataset_name: task_type = 'seg'
+            else: task_type = 'cv'
+            
+        # 获取 DataLoader 配置
         task_config_dict = cfg.data.get(dataset_name)
-        workers_per_gpu_val = getattr(task_config_dict.get('config'), 'workers_per_gpu', 2)
+        workers_per_gpu_val = 2
+        if task_config_dict and 'config' in task_config_dict:
+             # 尝试获取 workers_per_gpu，如果获取不到则默认 2
+             try:
+                 workers_per_gpu_val = getattr(task_config_dict.get('config'), 'workers_per_gpu', 2)
+             except:
+                 workers_per_gpu_val = 2
 
         data_loader = build_dataloader(
             dataset,
@@ -151,36 +169,63 @@ def main():
             dist=False,
             shuffle=False)
         
-        # --- 运行测试：使用自定义 runner ---
+        # --- 运行推理 ---
         outputs = custom_test_runner(
             model, 
             data_loader, 
-            task_name=dataset.task, # 确保传入正确的 task 属性
+            task_name=task_type,
             show=args.show, 
             out_dir=args.show_dir
         )
-        # ----------------------------------------
         
-        # 评估结果
+        # --- 准备评估 ---
+        # 1. 尝试从命令行获取 metrics
+        metrics = None
         if args.eval:
-            routing_task_type = getattr(dataset, 'task', dataset_name)
-            print(f"Evaluating {dataset_name} (Type: {routing_task_type})...")
+            metrics = get_task_metrics(task_type, args.eval)
+        
+        # 2. 准备评估参数 (从 cfg.evaluation 中获取)
+        eval_cfg_all = cfg.get('evaluation', {})
+        
+        # 复制一份配置，避免修改原始配置
+        task_eval_kwargs = eval_cfg_all.get(task_type, {}).copy()
+        
+        # ================== 【核心修复开始】 ==================
+        # 无论 metrics 是否已经有值，都必须从 kwargs 中移除 'metric' 键
+        # 否则下面 evaluate(..., metric=metrics, **kwargs) 会报参数重复错误
+        config_metrics = task_eval_kwargs.pop('metric', None)
+
+        # 3. 如果命令行没指定 metrics，使用配置中的默认值
+        if metrics is None:
+            metrics = config_metrics
             
-            current_metrics = get_task_metrics(routing_task_type, args.eval)
-            task_eval_kwargs = cfg.get('evaluation', {}).get(dataset_name, {})
+        # 4. 执行评估
+        if metrics:
+            print(f"Evaluating {dataset_name} ({task_type}) with metrics: {metrics}...")
+            print(f"Eval kwargs: {task_eval_kwargs}")
             
-            # 调用评估
-            eval_res = dataset.evaluate(outputs, metric=current_metrics, **task_eval_kwargs)
-            
-            # --- 打印最终结果 ---
-            if eval_res:
-                 print("="*50)
-                 for name, val in eval_res.items():
-                     print(f"[Eval Result] {name}: {val}")
-                 print("="*50)
-            else:
-                 print("[Eval Result] Evaluation function returned empty results.")
-                 
+            try:
+                eval_res = dataset.evaluate(outputs, metric=metrics, **task_eval_kwargs)
+                
+                # --- 强制打印结果 ---
+                # 有些数据集的 evaluate 方法可能只返回字典而不打印
+                if eval_res:
+                    print(f"\n[Final Results for {dataset_name}]")
+                    for name, val in eval_res.items():
+                        if isinstance(val, float):
+                            print(f"{name}: {val:.4f}")
+                        else:
+                            print(f"{name}: {val}")
+                else:
+                    print(f"Warning: Evaluation returned empty results for {dataset_name}.")
+                    
+            except Exception as e:
+                print(f"Error during evaluation of {dataset_name}: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"Skipping evaluation for {dataset_name}: No metrics found in args or config.")
+
 if __name__ == '__main__':
     main()
 

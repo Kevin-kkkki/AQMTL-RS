@@ -27,6 +27,7 @@ from mmdet.utils import (build_ddp, build_dp, get_device,
 from mtl.data.build import build_datasets, build_dataloaders, load_data_cfg
 from mtl.data.multi_eval_dataset import MultiEvalDatasets
 from mtl.engine import single_gpu_test, multi_gpu_test
+import models.multi
 
 
 def parse_args():
@@ -111,6 +112,37 @@ def main():
 
     cfg = Config.fromfile(args.config)
 
+    print("\n" + "="*30 + " DEBUG INFO " + "="*30)
+    import sys
+    import os.path as osp
+    # 1. 再次确保项目根目录在 sys.path 最前面
+    project_root = osp.dirname(osp.dirname(osp.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    
+    try:
+        # 2. 打印 'models' 包的来源，确认是否加载了正确的本地文件夹
+        import models
+        print(f"Loaded 'models' package from: {models.__file__ if hasattr(models, '__file__') else 'Namespace Package'}")
+        
+        # 3. 显式导入 MTL 类 (绕过 models.multi 的 __init__ 潜在问题)
+        from models.multi.multitask_learner import MTL
+        print(f"Successfully imported class: {MTL}")
+
+        # 4. 检查并强制注册到 MMCV 的 MODELS
+        from mmcv.cnn import MODELS
+        if 'MTL' in MODELS.module_dict:
+            print("Check: MTL is ALREADY in MODELS registry.")
+        else:
+            print("Check: MTL NOT found in registry. Forcing registration now...")
+            MODELS.register_module(module=MTL)
+            print("Check: MTL forcibly registered.")
+            
+    except Exception as e:
+        print(f"Error during manual import/registration: {e}")
+        # 如果这里报错，说明路径或者文件结构真的有问题
+    print("="*72 + "\n")
+
     # replace the ${key} with the value of cfg.key
     cfg = replace_cfg_vals(cfg)
 
@@ -119,6 +151,10 @@ def main():
 
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+
+    if cfg.get('custom_imports', None):
+        from mmcv.utils import import_modules_from_strings
+        import_modules_from_strings(**cfg['custom_imports'])
 
     # set multi-process settings
     setup_multi_processes(cfg)
