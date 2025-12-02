@@ -13,6 +13,11 @@ from mmseg.ops import resize
 from mtl.model.build import build_backbone, build_neck, build_head
 from mmdet.models.builder import MODELS 
 from quant.lsq_plus import Conv2dLSQ, LinearLSQ, ActLSQ, QuantActLSQ # 导入 QuantActLSQ
+from mmcv.parallel import DataContainer
+import numpy as np
+import mmcv
+from mmdet.core.visualization import imshow_det_bboxes
+
 
 try:
     from models.multi.cls_head.slvl_cls_head import SlvlClsHead
@@ -113,11 +118,6 @@ class MTL(BaseModule):
     def apply_mixed_precision_quantization(self, data_loader, num_tasks=3, ratio_8bit=0.5, default_task='cls'):
         """
         基于 TACQ 的混合精度量化策略 (Layer-wise Mixed Precision)。
-        Args:
-            data_loader: 校准数据加载器
-            num_tasks: 任务数
-            ratio_8bit: 8-bit 层比例
-            default_task: 校准数据对应的任务类型 ('cls', 'det', 'seg') <--- 新增参数
         """
         print_log(f"正在启动 TACQ 混合精度策略 (Top {ratio_8bit*100}% Layers -> 8-bit)...", logger='root')
         
@@ -132,16 +132,34 @@ class MTL(BaseModule):
         self.eval()
         self.zero_grad()
         
+        # 获取模型所在的设备 (CPU or CUDA)
+        device = next(self.parameters()).device
+        
         calibration_batches = 2
         
         try:
             for i, data in enumerate(data_loader):
                 if i >= calibration_batches: break
                 
-                # --- [Fix] 手动注入 task 参数 ---
+                # 解包 DataContainer 并移动到 GPU
+                unpacked_data = {}
+                for k, v in data.items():
+                    if isinstance(v, DataContainer):
+                        obj = v.data[0]
+                    else:
+                        obj = v
+                    
+                    if isinstance(obj, torch.Tensor):
+                        obj = obj.to(device)
+                    elif isinstance(obj, list):
+                        obj = [x.to(device) if isinstance(x, torch.Tensor) else x for x in obj]
+                    
+                    unpacked_data[k] = obj
+                
+                data = unpacked_data
+
                 if 'task' not in data:
                     data['task'] = default_task
-                # ------------------------------
 
                 with torch.enable_grad():
                     losses = self(**data)
@@ -152,9 +170,10 @@ class MTL(BaseModule):
             
         except Exception as e:
             print_log(f"Error during gradient calibration: {e}", logger='root')
+            import traceback
+            traceback.print_exc()
             print_log("CRITICAL: Calibration failed. Please check data loader.", logger='root')
             return 
-            # 注意：如果你已经删除了 apply_quantization 方法，不要在这里调用它，否则会报 AttributeError
 
         # 3. 计算分数
         print_log("Step 2/3: 计算层重要性并分配位宽...", logger='root')
@@ -163,24 +182,28 @@ class MTL(BaseModule):
 
         for name, module in self.named_modules():
             if any(k in name for k in skip_keywords): continue
-            
             if isinstance(module, (nn.Conv2d, nn.Linear, MMDETLinear if MMDETLinear else nn.Linear)):
                 score = compute_tacq_layer_score(module, nbits_probe=4)
                 layer_scores[name] = score
                 quantizable_layers.append(name)
         
-        # 排序与分配
+        if not layer_scores:
+             print_log("Warning: No layers found with valid gradients. Skipping quantization setup.", logger='root')
+             return
+
         sorted_layers = sorted(layer_scores.items(), key=lambda x: x[1], reverse=True)
         num_8bit = int(len(quantizable_layers) * ratio_8bit)
         layers_8bit_set = set([x[0] for x in sorted_layers[:num_8bit]])
         
         if sorted_layers:
-            print_log(f"Top-1 Sensitive Layer: {sorted_layers[0][0]}", logger='root')
+            print_log(f"Top-1 Sensitive Layer: {sorted_layers[0][0]} (Score: {sorted_layers[0][1]:.2e})", logger='root')
 
         self.zero_grad()
 
-        # 4. 执行替换
-        print_log("Step 3/3: 替换网络层...", logger='root')
+        # 4. 执行替换并打印分配结果
+        print_log("Step 3/3: 替换网络层并记录位宽...", logger='root')
+        
+        self.layer_bit_configs = {} 
         
         def _replace_layers_mixed(module, num_tasks, parent_name=''):
             for name, child in list(module.named_children()):
@@ -191,60 +214,219 @@ class MTL(BaseModule):
                 current_w_bits = 8 if full_name in layers_8bit_set else 4
                 current_a_bits = 4 
 
+                # 替换 Linear
                 if (isinstance(child, nn.Linear) or (MMDETLinear and isinstance(child, MMDETLinear))) \
                    and not isinstance(child, LinearLSQ):
                     new_linear = LinearLSQ(child.in_features, child.out_features, child.bias is not None, 
                         num_tasks=num_tasks, nbits_w=current_w_bits, nbits_a=current_a_bits)
                     new_linear.load_state_dict(child.state_dict(), strict=False)
+                    
+                    # [Fix] 关键修复：将新层移动到正确的设备 (GPU)
+                    new_linear = new_linear.to(device) 
+                    
                     setattr(module, name, new_linear)
+                    self.layer_bit_configs[full_name] = current_w_bits
                 
+                # 替换 Conv2d
                 elif isinstance(child, nn.Conv2d) and not isinstance(child, Conv2dLSQ):
                     new_conv = Conv2dLSQ(child.in_channels, child.out_channels, child.kernel_size,
                         child.stride, child.padding, child.dilation, child.groups, child.bias is not None, 
                         num_tasks=num_tasks, nbits_w=current_w_bits, nbits_a=current_a_bits)
                     new_conv.load_state_dict(child.state_dict(), strict=False)
+                    
+                    # [Fix] 关键修复：将新层移动到正确的设备 (GPU)
+                    new_conv = new_conv.to(device)
+                    
                     setattr(module, name, new_conv)
+                    self.layer_bit_configs[full_name] = current_w_bits
                 
+                # 替换激活函数
                 elif isinstance(child, (nn.ReLU, nn.GELU)) and not isinstance(child, ActLSQ):
                     new_act = QuantActLSQ(activation_cls=type(child), in_features=1, num_tasks=num_tasks, nbits_a=current_a_bits)
+                    
+                    # [Fix] 关键修复：将新层移动到正确的设备 (GPU)
+                    new_act = new_act.to(device)
+                    
                     setattr(module, name, new_act)
                 
                 else:
                     _replace_layers_mixed(child, num_tasks, full_name)
 
         _replace_layers_mixed(self, num_tasks)
+        
+        # 打印统计
+        print_log("\n" + "="*80, logger='root')
+        print_log(f"TACQ Mixed Precision Allocation Summary (Top {ratio_8bit*100:.0f}% -> 8-bit)", logger='root')
+        print_log("-" * 80, logger='root')
+        
+        sorted_configs = sorted(self.layer_bit_configs.items())
+        for lname, lbits in sorted_configs:
+            print_log(f"{lname:<60} | {lbits:<10}", logger='root')
+            
+        print_log("-" * 80, logger='root')
+        count_8bit = sum(1 for v in self.layer_bit_configs.values() if v == 8)
+        count_4bit = sum(1 for v in self.layer_bit_configs.values() if v == 4)
+        print_log(f"Total Quantized Layers: {len(self.layer_bit_configs)}", logger='root')
+        print_log(f"8-bit Layers: {count_8bit} (High Sensitivity)", logger='root')
+        print_log(f"4-bit Layers: {count_4bit} (Low Sensitivity)", logger='root')
+        print_log("="*80 + "\n", logger='root')
+        
         print_log("混合精度量化初始化完成。", logger='root')
-    # def apply_quantization(self, num_tasks=3, nbits_w=4, nbits_a=4):
-    #     print_log(f"正在应用 TSQ-MTC 量化 (Task Buffer Mode, tasks={num_tasks})...", logger='root')
-    #     def _replace_layers(module, num_tasks, nbits_w, nbits_a):
-    #         for name, child in module.named_children():
+    # def apply_mixed_precision_quantization(self, data_loader, num_tasks=3, ratio_8bit=0.5, default_task='cls'):
+    #     """
+    #     基于 TACQ 的混合精度量化策略 (Layer-wise Mixed Precision)。
+    #     """
+    #     print_log(f"正在启动 TACQ 混合精度策略 (Top {ratio_8bit*100}% Layers -> 8-bit)...", logger='root')
+        
+    #     # 1. 定义黑名单
+    #     skip_keywords = [
+    #         'fc_reg', 'fc_cls', 'bbox_pred', 'cls_score', 'mask_embed', 'cls_head.fc',
+    #         'patch_embed', 'absolute_pos_embed', 'pos_embed', 'backbone.stem'
+    #     ]
+
+    #     # 2. 收集梯度
+    #     print_log("Step 1/3: 利用校准数据计算梯度...", logger='root')
+    #     self.eval()
+    #     self.zero_grad()
+        
+    #     # 获取模型所在的设备 (CPU or CUDA)
+    #     device = next(self.parameters()).device
+        
+    #     calibration_batches = 2
+        
+    #     try:
+    #         for i, data in enumerate(data_loader):
+    #             if i >= calibration_batches: break
+                
+    #             # ================= Fix Start: 解包 DataContainer 并移动到 GPU =================
+    #             unpacked_data = {}
+    #             for k, v in data.items():
+    #                 # 1. 解包 DataContainer
+    #                 if isinstance(v, DataContainer):
+    #                     obj = v.data[0]
+    #                 else:
+    #                     obj = v
+                    
+    #                 # 2. 移动到设备 (GPU)
+    #                 if isinstance(obj, torch.Tensor):
+    #                     obj = obj.to(device)
+    #                 elif isinstance(obj, list):
+    #                     # 处理列表中的 Tensor (例如 img 可能是 [Tensor])
+    #                     obj = [x.to(device) if isinstance(x, torch.Tensor) else x for x in obj]
+                    
+    #                 unpacked_data[k] = obj
+                
+    #             data = unpacked_data
+    #             # ================= Fix End ==========================================
+
+    #             # 注入 task 参数
+    #             if 'task' not in data:
+    #                 data['task'] = default_task
+
+    #             with torch.enable_grad():
+    #                 losses = self(**data)
+    #                 loss, _ = self._parse_losses(losses)
+    #                 loss.backward()
+            
+    #         print_log("梯度计算完成。", logger='root')
+            
+    #     except Exception as e:
+    #         print_log(f"Error during gradient calibration: {e}", logger='root')
+    #         import traceback
+    #         traceback.print_exc() # 打印详细报错堆栈，方便排查
+    #         print_log("CRITICAL: Calibration failed. Please check data loader.", logger='root')
+    #         return 
+
+    #     # 3. 计算分数
+    #     print_log("Step 2/3: 计算层重要性并分配位宽...", logger='root')
+    #     layer_scores = {}
+    #     quantizable_layers = []
+
+    #     for name, module in self.named_modules():
+    #         if any(k in name for k in skip_keywords): continue
+    #         if isinstance(module, (nn.Conv2d, nn.Linear, MMDETLinear if MMDETLinear else nn.Linear)):
+    #             score = compute_tacq_layer_score(module, nbits_probe=4)
+    #             layer_scores[name] = score
+    #             quantizable_layers.append(name)
+        
+    #     # 排序与分配
+    #     if not layer_scores:
+    #          print_log("Warning: No layers found with valid gradients. Skipping quantization setup.", logger='root')
+    #          return
+
+    #     sorted_layers = sorted(layer_scores.items(), key=lambda x: x[1], reverse=True)
+    #     num_8bit = int(len(quantizable_layers) * ratio_8bit)
+    #     layers_8bit_set = set([x[0] for x in sorted_layers[:num_8bit]])
+        
+    #     if sorted_layers:
+    #         print_log(f"Top-1 Sensitive Layer: {sorted_layers[0][0]} (Score: {sorted_layers[0][1]:.2e})", logger='root')
+
+    #     self.zero_grad()
+
+    #     # 4. 执行替换并打印分配结果
+    #     print_log("Step 3/3: 替换网络层并记录位宽...", logger='root')
+        
+    #     self.layer_bit_configs = {} 
+        
+    #     def _replace_layers_mixed(module, num_tasks, parent_name=''):
+    #         # 使用 list(module.named_children()) 避免迭代时修改字典报错
+    #         for name, child in list(module.named_children()):
+    #             full_name = f"{parent_name}.{name}" if parent_name else name
+                
+    #             if any(k in name for k in skip_keywords): continue
+
+    #             current_w_bits = 8 if full_name in layers_8bit_set else 4
+    #             current_a_bits = 4 
+
+    #             # 替换 Linear
     #             if (isinstance(child, nn.Linear) or (MMDETLinear and isinstance(child, MMDETLinear))) \
     #                and not isinstance(child, LinearLSQ):
     #                 new_linear = LinearLSQ(child.in_features, child.out_features, child.bias is not None, 
-    #                     num_tasks=num_tasks, nbits_w=nbits_w, nbits_a=nbits_a)
+    #                     num_tasks=num_tasks, nbits_w=current_w_bits, nbits_a=current_a_bits)
     #                 new_linear.load_state_dict(child.state_dict(), strict=False)
     #                 setattr(module, name, new_linear)
+    #                 self.layer_bit_configs[full_name] = current_w_bits
+                
+    #             # 替换 Conv2d
     #             elif isinstance(child, nn.Conv2d) and not isinstance(child, Conv2dLSQ):
     #                 new_conv = Conv2dLSQ(child.in_channels, child.out_channels, child.kernel_size,
     #                     child.stride, child.padding, child.dilation, child.groups, child.bias is not None, 
-    #                     num_tasks=num_tasks, nbits_w=nbits_w, nbits_a=nbits_a)
+    #                     num_tasks=num_tasks, nbits_w=current_w_bits, nbits_a=current_a_bits)
     #                 new_conv.load_state_dict(child.state_dict(), strict=False)
     #                 setattr(module, name, new_conv)
+    #                 self.layer_bit_configs[full_name] = current_w_bits
                 
-    #             # --- [核心修复] 使用 QuantActLSQ 替换 ReLU，找回非线性 ---
+    #             # 替换激活函数
     #             elif isinstance(child, (nn.ReLU, nn.GELU)) and not isinstance(child, ActLSQ):
-    #                 new_act = QuantActLSQ(activation_cls=type(child), in_features=1, num_tasks=num_tasks, nbits_a=nbits_a)
+    #                 new_act = QuantActLSQ(activation_cls=type(child), in_features=1, num_tasks=num_tasks, nbits_a=current_a_bits)
     #                 setattr(module, name, new_act)
-    #             # --------------------------------------------------
+                
     #             else:
-    #                 _replace_layers(child, num_tasks, nbits_w, nbits_a)
-    #     _replace_layers(self, num_tasks, nbits_w, nbits_a)
-    #     print_log("量化层替换完毕，FP32权重已复制。", logger='root')
+    #                 _replace_layers_mixed(child, num_tasks, full_name)
 
-    # ... (init_weights, extract_feat 等保持你之前的修复版，一定要保留 [-3:] 切片) ...
-    # 为节省篇幅，以下函数保持不变，请确保你用了之前修复好的版本：
-    # init_weights, extract_feat (含[-3:]), forward_train/test, forward_train_cls (含 batch_input_shape 注入)
-    # simple_test_cls (含 batch_input_shape 注入), train_step, val_step, forward (含 set_task)
+    #     _replace_layers_mixed(self, num_tasks)
+        
+    #     # 打印最终统计报表
+    #     print_log("\n" + "="*80, logger='root')
+    #     print_log(f"TACQ Mixed Precision Allocation Summary (Top {ratio_8bit*100:.0f}% -> 8-bit)", logger='root')
+    #     print_log("-" * 80, logger='root')
+    #     print_log(f"{'Layer Name':<60} | {'Bits':<10}", logger='root')
+    #     print_log("-" * 80, logger='root')
+        
+    #     sorted_configs = sorted(self.layer_bit_configs.items())
+    #     for lname, lbits in sorted_configs:
+    #         print_log(f"{lname:<60} | {lbits:<10}", logger='root')
+            
+    #     print_log("-" * 80, logger='root')
+    #     count_8bit = sum(1 for v in self.layer_bit_configs.values() if v == 8)
+    #     count_4bit = sum(1 for v in self.layer_bit_configs.values() if v == 4)
+    #     print_log(f"Total Quantized Layers: {len(self.layer_bit_configs)}", logger='root')
+    #     print_log(f"8-bit Layers: {count_8bit} (High Sensitivity)", logger='root')
+    #     print_log(f"4-bit Layers: {count_4bit} (Low Sensitivity)", logger='root')
+    #     print_log("="*80 + "\n", logger='root')
+        
+    #     print_log("混合精度量化初始化完成。", logger='root')
+    
     
     def init_weights(self) -> None:
         super(MTL, self).init_weights()
@@ -261,6 +443,154 @@ class MTL(BaseModule):
         else:
             neck_feature = self.neck(backbone_feature)
         return neck_feature, backbone_feature
+    
+    def show_result(self, img, result, task_name=None, dataset_name=None, **kwargs):
+        """
+        统一的可视化入口，根据 task_name 分发给具体的画图函数
+        """
+        # 1. 尝试根据 task_name 分发
+        if task_name == 'cls':
+            return self.show_cls_result(img, result, dataset_name=dataset_name, **kwargs)
+        elif task_name == 'det':
+            return self.show_det_result(img, result, dataset_name=dataset_name, **kwargs)
+        elif task_name == 'seg':
+            return self.show_seg_result(img, result, dataset_name=dataset_name, **kwargs)
+        
+        # 2. 兜底逻辑 (修复 'list' has no attribute 'ndim' 的问题)
+        # 检测结果通常是 list of numpy arrays
+        if isinstance(result, list):
+            # 如果是分割结果 (mask通常是单个大矩阵或list[tensor])，但这里主要区分检测
+            # 检测结果 result[0] 是 bbox 数组 (N, 5)
+            # 只要检查里面元素是不是 array 或者空 array
+            if len(result) > 0 and (isinstance(result[0], np.ndarray) or len(result[0]) == 0):
+                 # 这是一个不太严谨的判断，但在你的多任务结构下，如果没有 task_name，
+                 # 最好还是依赖上面明确传入的 task_name。
+                 # 如果非要兜底，假设 list 就是检测结果
+                 return self.show_det_result(img, result, dataset_name=dataset_name, **kwargs)
+
+        # 默认回退到分类
+        return self.show_cls_result(img, result, dataset_name=dataset_name, **kwargs)
+
+    def show_cls_result(self, img, result, dataset_name=None, out_file=None, **kwargs):
+        # 1. 解析结果
+        if isinstance(result, list): result = result[0]
+        if isinstance(result, dict): result = result['pred_class']
+        if isinstance(result, torch.Tensor): result = result.cpu().numpy()
+        
+        # 2. 获取类别
+        class_id = np.argmax(result) if result.size > 1 else int(result)
+        class_name = str(class_id)
+        
+        if hasattr(self, 'CLASSES') and self.CLASSES:
+            labels = None
+            if dataset_name and dataset_name in self.CLASSES:
+                labels = self.CLASSES[dataset_name]
+            elif 'resisc' in self.CLASSES:
+                labels = self.CLASSES['resisc']
+            
+            if labels and class_id < len(labels):
+                class_name = labels[class_id]
+
+        # 3. 绘制并保存
+        if out_file:
+            import mmcv
+            import cv2
+            
+            img_vis = mmcv.imread(img).copy() # 读取并复制，防止修改原图
+            
+            # 使用 OpenCV 绘制文字 (位置: (10, 30), 字体: 0, 大小: 1, 颜色: 红色BGR, 线宽: 2)
+            # 确保 img_vis 是 contiguous array
+            img_vis = np.ascontiguousarray(img_vis)
+            
+            text = f'Pred: {class_name}'
+            cv2.putText(img_vis, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            mmcv.imwrite(img_vis, out_file)
+            
+        return img
+
+    def show_det_result(self, img, result, dataset_name=None, score_thr=0.3, out_file=None, **kwargs):
+        # 1. 准备类别名称
+        class_names = None
+        if hasattr(self, 'CLASSES') and self.CLASSES:
+            if dataset_name and dataset_name in self.CLASSES:
+                class_names = self.CLASSES[dataset_name]
+            elif 'dior' in self.CLASSES:
+                class_names = self.CLASSES['dior']
+        
+        # 2. 【核心修复】解包检测结果 (List -> bboxes, labels)
+        if isinstance(result, tuple):
+            bbox_result, segm_result = result
+            if isinstance(segm_result, tuple):
+                segm_result = segm_result[0]
+        else:
+            bbox_result, segm_result = result, None
+            
+        # 如果没有检测到任何框，直接保存原图并返回
+        if len(bbox_result) == 0:
+            if out_file:
+                import mmcv
+                mmcv.imwrite(img, out_file)
+            return img
+
+        # 将每个类别的 list 堆叠成一个大的 numpy 数组
+        bboxes = np.vstack(bbox_result)
+        
+        # 生成对应的标签数组
+        labels = [
+            np.full(bbox.shape[0], i, dtype=np.int32)
+            for i, bbox in enumerate(bbox_result)
+        ]
+        labels = np.concatenate(labels)
+        
+        # 3. 调用画图函数
+        # 注意：这里传入的是 bboxes 和 labels，而不是 result
+        img = imshow_det_bboxes(
+            img,
+            bboxes, 
+            labels,
+            class_names=class_names,
+            score_thr=score_thr,
+            bbox_color='green',
+            text_color='green',
+            thickness=2,
+            font_size=10,
+            win_name='',
+            show=False,
+            out_file=out_file
+        )
+        return img
+
+    def show_seg_result(self, img, result, dataset_name=None, palette=None, opacity=0.5, out_file=None, **kwargs):
+        if isinstance(result, list): result = result[0]
+        seg = result
+        
+        if palette is None:
+            if hasattr(self, 'PALETTE') and self.PALETTE is not None:
+                palette = self.PALETTE
+            else:
+                palette = [
+                    [255, 255, 255], [0, 0, 255], [0, 255, 255], 
+                    [0, 255, 0], [255, 255, 0], [255, 0, 0]
+                ]
+        palette = np.array(palette)
+
+        img = mmcv.imread(img)
+        color_seg = np.zeros((seg.shape[0], seg.shape[1], 3), dtype=np.uint8)
+        
+        max_label = len(palette) - 1
+        seg[seg > max_label] = max_label 
+        
+        for label, color in enumerate(palette):
+            color_seg[seg == label, :] = color
+        
+        color_seg = color_seg[..., ::-1]
+        img = img * (1 - opacity) + color_seg * opacity
+        img = img.astype(np.uint8)
+
+        if out_file:
+            mmcv.imwrite(img, out_file)
+        return img
 
     def forward_train(self, task: str, *args, **kwargs):
         assert task in supported_tasks

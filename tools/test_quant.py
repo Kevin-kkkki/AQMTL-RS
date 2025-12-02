@@ -18,6 +18,8 @@ from mmcv.runner import load_checkpoint
 from mmdet.datasets import build_dataloader
 from mmdet.models import build_detector
 from typing import List
+import mmcv
+import os.path as osp
 
 # --- 1. 路径与注册修复 (HARD FIX) ---
 project_root = osp.dirname(osp.dirname(osp.abspath(__file__)))
@@ -36,7 +38,20 @@ except ImportError as e:
     print(f"Warning: Import failed or modules already loaded: {e}")
 
 # --- 自定义测试 Runner ---
-def custom_test_runner(model, data_loader, task_name, show=False, out_dir=None):
+# --- tools/test_quant.py ---
+
+def unwrap_img_metas(data_item):
+    """递归解包 img_metas，直到拿到真正的 list"""
+    if hasattr(data_item, 'data'):
+        data_item = data_item.data[0]
+    if isinstance(data_item, list) and len(data_item) > 0:
+        if hasattr(data_item[0], 'data'):
+            data_item = data_item[0].data[0]
+    if isinstance(data_item, list) and len(data_item) > 0 and isinstance(data_item[0], list):
+        data_item = data_item[0]
+    return data_item
+
+def custom_test_runner(model, data_loader, task_name, dataset_name=None, show=False, out_dir=None):
     model_to_eval = model.module if hasattr(model, 'module') else model
     model_to_eval.eval() 
     
@@ -44,14 +59,71 @@ def custom_test_runner(model, data_loader, task_name, show=False, out_dir=None):
     from mmcv.utils import ProgressBar
     prog_bar = ProgressBar(len(data_loader.dataset))
     
+    if out_dir:
+        mmcv.mkdir_or_exist(out_dir)
+    
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             data['task'] = task_name 
-            # forward_test
             outputs = model(return_loss=False, rescale=True, **data)
         results.extend(outputs)
+        
+        if show or out_dir:
+            if 'img_metas' in data:
+                # 使用辅助函数安全获取
+                img_metas = unwrap_img_metas(data['img_metas'])
+                
+                # 确保 img_metas 是列表且不为空
+                if not isinstance(img_metas, list):
+                    img_metas = [img_metas]
+
+                for j, output in enumerate(outputs):
+                    if j >= len(img_metas): break
+                        
+                    img_meta = img_metas[j]
+                    img_path = img_meta['filename']
+                    
+                    out_file = None
+                    if out_dir:
+                        file_name = osp.basename(img_path)
+                        out_file = osp.join(out_dir, file_name)
+                    
+                    try:
+                        # --- 核心修改：显式传入 task_name 和 dataset_name ---
+                        model_to_eval.show_result(
+                            img_path,
+                            output,
+                            task_name=task_name,        # 明确任务类型 ('cls', 'det', 'seg')
+                            dataset_name=dataset_name,  # 明确数据集 ('resisc', 'dior', ...)
+                            show=show,
+                            out_file=out_file,
+                            score_thr=0.3 
+                        )
+                    except Exception as e:
+                        # --- 核心修改：打印错误而不是忽略 ---
+                        # 为了不刷屏，只打印前几次错误
+                        if i < 5: 
+                            print(f"\n[Error] Vis failed for {osp.basename(img_path)}: {e}")
+                        pass
+
         prog_bar.update(len(data['img_metas']))
     return results
+# def custom_test_runner(model, data_loader, task_name, show=False, out_dir=None):
+#     model_to_eval = model.module if hasattr(model, 'module') else model
+#     model_to_eval.eval() 
+    
+#     results = []
+#     from mmcv.utils import ProgressBar
+#     prog_bar = ProgressBar(len(data_loader.dataset))
+    
+#     for i, data in enumerate(data_loader):
+#         with torch.no_grad():
+#             data['task'] = task_name 
+#             # forward_test
+#             outputs = model(return_loss=False, rescale=True, **data)
+#         results.extend(outputs)
+#         prog_bar.update(len(data['img_metas']))
+#     return results
 
 # --- 指标筛选器 (修复了 args 作用域问题) ---
 def get_task_metrics(task_type: str, eval_args: List[str]):
@@ -135,15 +207,13 @@ def main():
     model = MMDataParallel(model, device_ids=[0])
     
     # 5. 构建数据集
-    # 注意：build_datasets 返回的是 {dataset_name: dataset_obj}
     datasets_dict = build_datasets(cfg.data, split='test')
     
     # 6. 循环测试每个任务
     for dataset_name, dataset in datasets_dict.items():
         print(f"\n\n{'='*20} Testing Task: {dataset_name} {'='*20}")
         
-        # 获取任务类型 (cls/det/seg)
-        # 如果 dataset 对象没有 task 属性，尝试从名字推断作为兜底
+        # 获取任务类型
         if hasattr(dataset, 'task'):
             task_type = dataset.task
         else:
@@ -156,7 +226,6 @@ def main():
         task_config_dict = cfg.data.get(dataset_name)
         workers_per_gpu_val = 2
         if task_config_dict and 'config' in task_config_dict:
-             # 尝试获取 workers_per_gpu，如果获取不到则默认 2
              try:
                  workers_per_gpu_val = getattr(task_config_dict.get('config'), 'workers_per_gpu', 2)
              except:
@@ -169,46 +238,51 @@ def main():
             dist=False,
             shuffle=False)
         
+        # ================== 【修改点：构造分任务的可视化目录】 ==================
+        task_out_dir = None
+        if args.show_dir:
+            # 自动拼接子目录，例如: work_dirs/vis_results/dior
+            task_out_dir = osp.join(args.show_dir, dataset_name)
+            print(f"[Visualizer] Results for {dataset_name} will be saved to: {task_out_dir}")
+        # ====================================================================
+
         # --- 运行推理 ---
         outputs = custom_test_runner(
             model, 
             data_loader, 
             task_name=task_type,
+            dataset_name=dataset_name,
             show=args.show, 
-            out_dir=args.show_dir
+            out_dir=task_out_dir  # <--- 这里传入的是子目录，而不是 args.show_dir
         )
+
+        # 保存结果文件 (.pkl)
+        if args.out:
+            import mmcv 
+            out_file = args.out
+            if len(datasets_dict) > 1:
+                base, ext = os.path.splitext(out_file)
+                out_file = f"{base}_{dataset_name}{ext}"
+                
+            print(f'\nwriting results to {out_file}')
+            mmcv.dump(outputs, out_file)
         
         # --- 准备评估 ---
-        # 1. 尝试从命令行获取 metrics
         metrics = None
         if args.eval:
             metrics = get_task_metrics(task_type, args.eval)
         
-        # 2. 准备评估参数 (从 cfg.evaluation 中获取)
         eval_cfg_all = cfg.get('evaluation', {})
-        
-        # 复制一份配置，避免修改原始配置
         task_eval_kwargs = eval_cfg_all.get(task_type, {}).copy()
-        
-        # ================== 【核心修复开始】 ==================
-        # 无论 metrics 是否已经有值，都必须从 kwargs 中移除 'metric' 键
-        # 否则下面 evaluate(..., metric=metrics, **kwargs) 会报参数重复错误
         config_metrics = task_eval_kwargs.pop('metric', None)
 
-        # 3. 如果命令行没指定 metrics，使用配置中的默认值
         if metrics is None:
             metrics = config_metrics
             
-        # 4. 执行评估
         if metrics:
             print(f"Evaluating {dataset_name} ({task_type}) with metrics: {metrics}...")
-            print(f"Eval kwargs: {task_eval_kwargs}")
-            
             try:
                 eval_res = dataset.evaluate(outputs, metric=metrics, **task_eval_kwargs)
-                
-                # --- 强制打印结果 ---
-                # 有些数据集的 evaluate 方法可能只返回字典而不打印
                 if eval_res:
                     print(f"\n[Final Results for {dataset_name}]")
                     for name, val in eval_res.items():
@@ -218,13 +292,151 @@ def main():
                             print(f"{name}: {val}")
                 else:
                     print(f"Warning: Evaluation returned empty results for {dataset_name}.")
-                    
             except Exception as e:
                 print(f"Error during evaluation of {dataset_name}: {e}")
                 import traceback
                 traceback.print_exc()
         else:
-            print(f"Skipping evaluation for {dataset_name}: No metrics found in args or config.")
+            print(f"Skipping evaluation for {dataset_name}: No metrics found.")
+
+# def main():
+#     args = parse_args()
+#     cfg = Config.fromfile(args.config)
+#     if args.cfg_options is not None:
+#         cfg.merge_from_dict(args.cfg_options)
+    
+#     if cfg.get('custom_imports', None):
+#         from mmcv.utils import import_modules_from_strings
+#         import_modules_from_strings(**cfg['custom_imports'])
+        
+#     cfg.model.pretrained = None
+
+#     # 1. 构建模型
+#     print(f"Building model from config...")
+#     model = build_detector(cfg.model, train_cfg=None, test_cfg=cfg.get('test_cfg'))
+    
+#     # 2. 应用量化结构
+#     if cfg.get('quantize', False):
+#         print("\n[Test] Applying TSQ-MTC Quantization Structure...")
+#         if hasattr(model, 'apply_quantization'):
+#             model.apply_quantization(num_tasks=3)
+#         elif hasattr(model, 'module') and hasattr(model.module, 'apply_quantization'):
+#             model.module.apply_quantization(num_tasks=3)
+#         print("[Test] Quantization layers applied.")
+    
+#     # 3. 加载权重
+#     print(f"[Test] Loading checkpoint from {args.checkpoint}...")
+#     load_checkpoint(model, args.checkpoint, map_location='cpu')
+
+#     # 4. DataParallel
+#     model = MMDataParallel(model, device_ids=[0])
+    
+#     # 5. 构建数据集
+#     # 注意：build_datasets 返回的是 {dataset_name: dataset_obj}
+#     datasets_dict = build_datasets(cfg.data, split='test')
+    
+#     # 6. 循环测试每个任务
+#     for dataset_name, dataset in datasets_dict.items():
+#         print(f"\n\n{'='*20} Testing Task: {dataset_name} {'='*20}")
+        
+#         # 获取任务类型 (cls/det/seg)
+#         # 如果 dataset 对象没有 task 属性，尝试从名字推断作为兜底
+#         if hasattr(dataset, 'task'):
+#             task_type = dataset.task
+#         else:
+#             if 'resisc' in dataset_name: task_type = 'cls'
+#             elif 'dior' in dataset_name: task_type = 'det'
+#             elif 'potsdam' in dataset_name: task_type = 'seg'
+#             else: task_type = 'cv'
+            
+#         # 获取 DataLoader 配置
+#         task_config_dict = cfg.data.get(dataset_name)
+#         workers_per_gpu_val = 2
+#         if task_config_dict and 'config' in task_config_dict:
+#              # 尝试获取 workers_per_gpu，如果获取不到则默认 2
+#              try:
+#                  workers_per_gpu_val = getattr(task_config_dict.get('config'), 'workers_per_gpu', 2)
+#              except:
+#                  workers_per_gpu_val = 2
+
+#         data_loader = build_dataloader(
+#             dataset,
+#             samples_per_gpu=1, 
+#             workers_per_gpu=int(workers_per_gpu_val), 
+#             dist=False,
+#             shuffle=False)
+        
+#         # --- 运行推理 ---
+#         outputs = custom_test_runner(
+#             model, 
+#             data_loader, 
+#             task_name=task_type,
+#             show=args.show, 
+#             out_dir=args.show_dir
+#         )
+
+#         # 如果指定了 --out 参数，则保存结果
+#         if args.out:
+#             # 引入 mmcv 用于保存
+#             import mmcv 
+            
+#             # 处理输出文件名
+#             out_file = args.out
+#             # 如果配置中有多个任务/数据集，为了防止覆盖，给文件名加个前缀
+#             if len(datasets_dict) > 1:
+#                 base, ext = os.path.splitext(out_file)
+#                 out_file = f"{base}_{dataset_name}{ext}"
+                
+#             print(f'\nwriting results to {out_file}')
+#             mmcv.dump(outputs, out_file)
+        
+#         # --- 准备评估 ---
+#         # 1. 尝试从命令行获取 metrics
+#         metrics = None
+#         if args.eval:
+#             metrics = get_task_metrics(task_type, args.eval)
+        
+#         # 2. 准备评估参数 (从 cfg.evaluation 中获取)
+#         eval_cfg_all = cfg.get('evaluation', {})
+        
+#         # 复制一份配置，避免修改原始配置
+#         task_eval_kwargs = eval_cfg_all.get(task_type, {}).copy()
+        
+#         # ================== 【核心修复开始】 ==================
+#         # 无论 metrics 是否已经有值，都必须从 kwargs 中移除 'metric' 键
+#         # 否则下面 evaluate(..., metric=metrics, **kwargs) 会报参数重复错误
+#         config_metrics = task_eval_kwargs.pop('metric', None)
+
+#         # 3. 如果命令行没指定 metrics，使用配置中的默认值
+#         if metrics is None:
+#             metrics = config_metrics
+            
+#         # 4. 执行评估
+#         if metrics:
+#             print(f"Evaluating {dataset_name} ({task_type}) with metrics: {metrics}...")
+#             print(f"Eval kwargs: {task_eval_kwargs}")
+            
+#             try:
+#                 eval_res = dataset.evaluate(outputs, metric=metrics, **task_eval_kwargs)
+                
+#                 # --- 强制打印结果 ---
+#                 # 有些数据集的 evaluate 方法可能只返回字典而不打印
+#                 if eval_res:
+#                     print(f"\n[Final Results for {dataset_name}]")
+#                     for name, val in eval_res.items():
+#                         if isinstance(val, float):
+#                             print(f"{name}: {val:.4f}")
+#                         else:
+#                             print(f"{name}: {val}")
+#                 else:
+#                     print(f"Warning: Evaluation returned empty results for {dataset_name}.")
+                    
+#             except Exception as e:
+#                 print(f"Error during evaluation of {dataset_name}: {e}")
+#                 import traceback
+#                 traceback.print_exc()
+#         else:
+#             print(f"Skipping evaluation for {dataset_name}: No metrics found in args or config.")
 
 if __name__ == '__main__':
     main()
