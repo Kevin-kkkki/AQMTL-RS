@@ -1,21 +1,20 @@
 # 1. 继承全精度（FP32）的基础配置
-# 这样 backbone, head, data 等所有不需要改的参数都会自动读进来
 _base_ = ['./MTL_slvlcls_swin-t-p4-w7_1x1_resisc&dior&potsdam.py']
 
 # 2. 开启量化开关
-# 对应 tools/train.py 中的 if cfg.get('quantize', False):
 quantize = True
-
-# 对应 models/multi/multitask_learner.py 中的 self.quantize
 model = dict(quantize=True)
 
-# 3. 调整训练计划 (针对微调缩短时间)
-# 将总迭代次数从 30万 减少到 15万
-runner = dict(type='IterBasedRunner', max_iters=150000)
+# 3. 调整训练计划 (恢复到标准长周期)
+# 将总迭代次数设定为 30万
+runner = dict(type='IterBasedRunner', max_iters=300000)
 
-# 调整学习率衰减点 (按比例提前，例如在 12w 和 14w 处衰减)
-lr_config = dict(policy='step', step=[120000, 140000])
+# 调整学习率衰减点 (按比例扩展: 15w时的12w/14w -> 30w时的24w/28w)
+lr_config = dict(policy='step', step=[240000, 280000])
 
-# 4. 加密保存和评估频率 (因为总时间变短了)
-checkpoint_config = dict(interval=10000)
-evaluation = dict(interval=5000)
+# 4. 调整保存和评估频率 (由于总时间变长，适当放宽间隔以节省时间和磁盘)
+# 每 20,000 次保存一次权重 (原 10,000)
+checkpoint_config = dict(interval=20000)
+
+# 每 10,000 次评估一次验证集 (原 5,000)
+evaluation = dict(interval=10000)

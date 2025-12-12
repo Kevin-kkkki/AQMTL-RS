@@ -1,5 +1,3 @@
-# Copyright (c) OpenMMLab. All rights reserved.
-
 import sys
 import os.path as osp
 
@@ -34,7 +32,6 @@ from mmdet.models import build_detector as build_model
 from mtl.data.build import build_datasets
 
 def parse_args():
-    # ... (保持原有参数解析代码不变) ...
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
@@ -52,6 +49,10 @@ def parse_args():
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm', 'mpi'], default='none')
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--load_task_pretrain', action='store_true')
+    
+    # [新增] Phase 1 开关：仅生成 Mask 并退出
+    parser.add_argument('--gen-mask', action='store_true', help='Phase 1: Generate fine-grained mask and exit')
+    
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -105,107 +106,132 @@ def main():
         set_random_seed(seed, deterministic=args.deterministic)
     cfg.seed = seed
 
-   # =============================================================================
+    # =============================================================================
     # Step 1: 构建 FP32 模型
     # =============================================================================
     model = build_model(cfg.model)
     model.init_weights()
 
     # =============================================================================
-    # Step 2: 加载 FP32 权重 (必须在量化前完成，TACQ 依赖它计算梯度)
+    # Step 2: 加载 FP32 权重 (必须在量化前完成)
     # =============================================================================
-    # 优先使用 load_from_fp32，如果没有，则回退使用标准的 load_from
     fp32_ckpt = cfg.get('load_from_fp32', None) or cfg.get('load_from', None)
     
     if fp32_ckpt:
         logger.info(f"Loading FP32 weights from {fp32_ckpt} for initialization/calibration ...")
-        # strict=False 允许加载时有一些不匹配（通常用于微调）
         load_checkpoint(model, fp32_ckpt, map_location='cpu', strict=False, logger=logger)
     elif args.load_task_pretrain:
         if hasattr(model, 'load_task_pretrain'):
             logger.info("Loading task pretrained weights via model.load_task_pretrain() ...")
             model.load_task_pretrain()
     else:
-        logger.warning("Warning: No pretrained weights loaded! TACQ calibration will be random if quantize=True.")
+        logger.warning("Warning: No pretrained weights loaded! Calibration will be random if quantize=True.")
 
     # =============================================================================
-    # Step 3: 构建数据集 (必须在量化前构建，TACQ 需要校准数据)
+    # Step 3: 构建数据集 (提前构建，因量化校准需要数据)
     # =============================================================================
     logger.info("Building datasets...")
     datasets = build_datasets(cfg.data)
     
-    # 设置类别名
     CLASSES = {name: dataset.CLASSES for name, dataset in datasets.items()}
     model.CLASSES = CLASSES
 
     # =============================================================================
-    # Step 4: 应用量化策略 (TACQ 混合精度 或 标准均匀量化)
+    # Step 4: 应用量化策略 (Two-Stage Fine-Grained QAT)
     # =============================================================================
     if cfg.get('quantize', False):
-        logger.info("准备进行 TACQ 混合精度量化初始化...")
         
-        # 1. 获取校准数据集 (取第一个 key)
-        # 此时 datasets 已经定义，可以安全使用了
-        dataset_keys = list(datasets.keys())
-        calib_dataset_name = dataset_keys[0]
-        calib_dataset = datasets[calib_dataset_name]
+        # 定义 Mask 文件路径
+        mask_file_path = osp.join(cfg.work_dir, 'fine_grained_mask.pth')
         
-        # 2. 自动推断任务类型
-        target_task = 'cls' # 默认值
-        if 'resisc' in calib_dataset_name.lower():
+        # 定义辅助函数：构建校准 DataLoader
+        def build_calib_loader():
+            logger.info("Preparing calibration dataloader...")
+            dataset_keys = list(datasets.keys())
+            calib_dataset_name = dataset_keys[0]
+            calib_dataset = datasets[calib_dataset_name]
+            
+            # 自动推断任务
             target_task = 'cls'
-        elif 'dior' in calib_dataset_name.lower():
-            target_task = 'det'
-        elif 'potsdam' in calib_dataset_name.lower():
-            target_task = 'seg'
-        
-        logger.info(f"Selected calibration dataset: {calib_dataset_name}, Task: {target_task}")
+            if 'resisc' in calib_dataset_name.lower(): target_task = 'cls'
+            elif 'dior' in calib_dataset_name.lower(): target_task = 'det'
+            elif 'potsdam' in calib_dataset_name.lower(): target_task = 'seg'
+            
+            logger.info(f"Calibration dataset: {calib_dataset_name}, Task: {target_task}")
 
-        # 3. 修复 GroupSampler 问题
-        if not hasattr(calib_dataset, 'flag'):
-            import numpy as np
-            calib_dataset.flag = np.zeros(len(calib_dataset), dtype=np.int64)
+            if not hasattr(calib_dataset, 'flag'):
+                import numpy as np
+                calib_dataset.flag = np.zeros(len(calib_dataset), dtype=np.int64)
 
-        # 4. 构建 Loader
-        from mmdet.datasets import build_dataloader
-        calib_loader = build_dataloader(
-            calib_dataset,
-            samples_per_gpu=2,
-            workers_per_gpu=0,
-            dist=False,
-            shuffle=True
-        )
-        
-        # 5. 调用混合精度初始化
-        # 优先尝试混合精度，如果没有该方法则回退到普通量化
-        if hasattr(model, 'apply_mixed_precision_quantization'):
-            model.apply_mixed_precision_quantization(
-                data_loader=calib_loader, 
-                num_tasks=3, 
-                ratio_8bit=0.5,
-                default_task=target_task
+            from mmdet.datasets import build_dataloader
+            loader = build_dataloader(
+                calib_dataset, samples_per_gpu=2, workers_per_gpu=0, dist=False, shuffle=True
             )
-        elif hasattr(model, 'module') and hasattr(model.module, 'apply_mixed_precision_quantization'):
-            model.module.apply_mixed_precision_quantization(
-                data_loader=calib_loader, 
-                num_tasks=3, 
-                ratio_8bit=0.5,
-                default_task=target_task
-            )
+            return loader, target_task
+
+        # ---------------------------------------------------------------------
+        # [Phase 1] 生成 Mask 阶段 (使用 --gen-mask 参数触发)
+        # ---------------------------------------------------------------------
+        if args.gen_mask:
+            logger.info(f"\n{'='*20} [Phase 1] Generating Fine-Grained Mask {'='*20}")
+            calib_loader, default_task = build_calib_loader()
+            
+            if hasattr(model, 'generate_fine_grained_mask'):
+                # ratio_high=0.05 即 Top 5% 权重为 8-bit
+                model.generate_fine_grained_mask(
+                    calib_loader, 
+                    save_path=mask_file_path, 
+                    ratio_high=0.05, 
+                    default_task=default_task
+                )
+            elif hasattr(model, 'module') and hasattr(model.module, 'generate_fine_grained_mask'):
+                model.module.generate_fine_grained_mask(
+                    calib_loader, 
+                    save_path=mask_file_path, 
+                    ratio_high=0.05, 
+                    default_task=default_task
+                )
+            else:
+                raise RuntimeError("Model does not implement 'generate_fine_grained_mask'. Check multitask_learner.py.")
+                
+            logger.info("Mask generation finished. Exiting program.")
+            return  # 阶段一完成后直接退出
+
+        # ---------------------------------------------------------------------
+        # [Phase 2] 应用 Mask 进行训练阶段
+        # ---------------------------------------------------------------------
+        # 这里增加了强制检查，如果没开生成模式且 mask 不存在，直接报错，防止回退到普通量化
+        elif osp.exists(mask_file_path):
+            logger.info(f"\n{'='*20} [Phase 2] Applying Fine-Grained Mask for QAT {'='*20}")
+            logger.info(f"Loading mask from: {mask_file_path}")
+            
+            if hasattr(model, 'apply_fine_grained_quantization'):
+                model.apply_fine_grained_quantization(mask_file_path, num_tasks=3)
+            elif hasattr(model, 'module') and hasattr(model.module, 'apply_fine_grained_quantization'):
+                model.module.apply_fine_grained_quantization(mask_file_path, num_tasks=3)
+            else:
+                logger.warning("Model missing 'apply_fine_grained_quantization' method!")
+
+        # ---------------------------------------------------------------------
+        # [Error/Fallback] 如果没有 Mask 也没指定生成，报错或回退
+        # ---------------------------------------------------------------------
         else:
-            # 回退逻辑
-            logger.info("Applying Standard TSQ-MTC Quantization (Uniform)...")
-            if hasattr(model, 'apply_quantization'):
-                model.apply_quantization(num_tasks=3)
-            elif hasattr(model, 'module'):
-                model.module.apply_quantization(num_tasks=3)
-        
-        # 6. 加载 QAT 权重 (仅当这是 Resume 训练时)
-        # 如果是首次从 FP32 转 QAT，这一步是不需要的，因为已经在 Step 2 加载了 FP32 权重
-        # 只有当你中断了 QAT 训练，想继续训练时，才需要这里加载
-        if cfg.get('resume_from'): # 注意：通常是用 resume_from 而不是 load_from 来区分
+            # 强烈建议这里直接报错，防止你再次遇到精度崩塌的问题
+            # 如果你想回退，可以把 raise 换成 logger.warning 并取消下面的注释
+            raise FileNotFoundError(f"【严重错误】在 {mask_file_path} 未找到 Mask 文件！\n"
+                                    "请先运行 Phase 1 (--gen-mask) 生成 Mask，或检查路径。")
+            
+            # logger.info("\n[Warning] No mask found and --gen-mask not set. Falling back to standard TACQ/Uniform QAT...")
+            # calib_loader, default_task = build_calib_loader()
+            # if hasattr(model, 'apply_mixed_precision_quantization'):
+            #     model.apply_mixed_precision_quantization(
+            #         data_loader=calib_loader, num_tasks=3, ratio_8bit=0.5, default_task=default_task)
+            # ...
+
+        # 加载 QAT Checkpoint (Resume 逻辑)
+        if cfg.get('resume_from'):
              logger.info(f"Resuming QAT training from {cfg.resume_from} ...")
-             # load_checkpoint(model, cfg.resume_from, ...) # runner 会自动处理 resume，这里其实可以省略
+             # checkpoint 由 train_model 内部的 runner 处理，这里仅打印日志
 
     # =============================================================================
     # Step 5: 开始训练

@@ -110,6 +110,181 @@ class MTL(BaseModule):
         self.bbox_head = build_head(bbox_head, 'mmdet')
         self.seg_head = build_head(seg_head, 'mmseg')
 
+    def generate_fine_grained_mask(self, data_loader, save_path='fine_grained_mask.pth', ratio_high=0.05, default_task='cls'):
+        """
+        Phase 1: 计算重要性得分。
+        【策略升级】: 实施 4 组独立排序 (Shared, CLS, DET, SEG)。
+        这能确保检测任务的新独立 Encoder 获得足够的高精度权重，同时不影响其他任务。
+        """
+        from mmcv.utils import print_log
+        print_log(f"\n[Phase 1] 正在生成细粒度混合精度 Mask...", logger='root')
+        print_log(f"策略: 4组独立排序 (Shared/CLS/DET/SEG)，Top {ratio_high*100}% 保留 8-bit。", logger='root')
+        
+        # 1. 计算梯度 (Calibration)
+        self.eval()
+        self.zero_grad()
+        device = next(self.parameters()).device
+        
+        # 运行少量 Batch
+        for i, data in enumerate(data_loader):
+            if i >= 2: break 
+            
+            unpacked_data = {}
+            for k, v in data.items():
+                if 'DataContainer' in str(type(v)): obj = v.data[0]
+                else: obj = v
+                if isinstance(obj, torch.Tensor): obj = obj.to(device)
+                elif isinstance(obj, list): obj = [x.to(device) if isinstance(x, torch.Tensor) else x for x in obj]
+                unpacked_data[k] = obj
+            
+            if 'task' not in unpacked_data: unpacked_data['task'] = default_task
+            
+            with torch.enable_grad():
+                losses = self(**unpacked_data)
+                loss, _ = self._parse_losses(losses)
+                loss.backward()
+        
+        print_log("梯度计算完成，开始分组计算得分...", logger='root')
+
+        # 2. 定义分组容器
+        scores_dict = {
+            'shared': [],
+            'cls_head': [],
+            'det_head': [],
+            'seg_head': []
+        }
+        
+        layer_map = {} 
+        layer_scores = {}
+
+        skip_keywords = ['fc_reg', 'fc_cls', 'bbox_pred', 'mask_embed'] 
+
+        for name, module in self.named_modules():
+            if any(k in name for k in skip_keywords): continue
+            
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                if module.weight.grad is None: continue
+                
+                # Metric: |W| * |Grad|
+                score = module.weight.data.abs() * module.weight.grad.data.abs()
+                layer_scores[name] = score
+                
+                # ========================================================
+                # 【关键逻辑】 智能分组 (4组)
+                # ========================================================
+                group_name = 'shared' # 默认
+                
+                if name.startswith('cls_head'):
+                    group_name = 'cls_head'
+                
+                elif name.startswith('bbox_head'):
+                    # 包含: 检测头本身 + 新增的独立 Encoder (现在都在 bbox_head 下)
+                    group_name = 'det_head'
+                
+                elif name.startswith('seg_head'):
+                    group_name = 'seg_head'
+                
+                elif any(name.startswith(p) for p in ['backbone', 'neck', 'shared_encoder']):
+                    # Shared Encoder 现在只服务 CLS/SEG，归类为共享组
+                    group_name = 'shared'
+                
+                scores_dict[group_name].append(score.view(-1))
+                layer_map[name] = group_name
+
+        # 3. 分别计算各组阈值
+        def get_threshold(score_list, ratio):
+            if not score_list: return float('inf')
+            all_s = torch.cat(score_list) 
+            k = int(all_s.numel() * ratio)
+            if k < 1: k = 1
+            return torch.topk(all_s, k)[0][-1]
+
+        thresholds = {}
+        print_log(f"{'-'*40}", logger='root')
+        for group, scores in scores_dict.items():
+            thresholds[group] = get_threshold(scores, ratio_high)
+            print_log(f"Threshold [{group:<10}]: {thresholds[group]:.4e} (Params: {sum(s.numel() for s in scores)})", logger='root')
+        print_log(f"{'-'*40}", logger='root')
+
+        # 4. 生成并保存 Mask
+        mask_dict = {}
+        total_params = 0
+        total_8bit = 0
+        
+        for name, score in layer_scores.items():
+            if name not in layer_map: continue
+            
+            group = layer_map[name]
+            thresh = thresholds[group]
+            
+            # 生成 0/1 Mask
+            mask = (score >= thresh).float()
+            
+            mask_dict[name] = mask.cpu()
+            total_params += mask.numel()
+            total_8bit += mask.sum().item()
+
+        print_log(f"Mask 生成完毕。全局 8-bit 比例: {total_8bit/total_params*100:.2f}%", logger='root')
+        torch.save(mask_dict, save_path)
+        print_log(f"Mask 已保存至: {save_path}", logger='root')
+
+    def apply_fine_grained_quantization(self, mask_path, num_tasks=3):
+        """
+        Phase 2: 加载 Mask，替换层为 MixedLSQ，准备训练。
+        """
+        from mmcv.utils import print_log
+        from quant.mixed_lsq import MixedConv2dLSQ, MixedLinearLSQ # 确保导入
+        
+        print_log(f"\n[Phase 2] 正在应用细粒度混合精度 (加载 Mask: {mask_path})...", logger='root')
+        
+        if not osp.exists(mask_path):
+            raise FileNotFoundError(f"Mask file not found: {mask_path}")
+            
+        mask_dict = torch.load(mask_path)
+        device = next(self.parameters()).device
+        replaced_count = 0
+        
+        # 递归替换函数
+        def _replace_recursive(module, parent_name=''):
+            nonlocal replaced_count
+            for name, child in list(module.named_children()):
+                full_name = f"{parent_name}.{name}" if parent_name else name
+                
+                # 如果该层在 mask 字典中，则进行替换
+                if full_name in mask_dict:
+                    mask = mask_dict[full_name].to(device)
+                    
+                    new_layer = None
+                    if isinstance(child, nn.Conv2d):
+                        new_layer = MixedConv2dLSQ(
+                            child.in_channels, child.out_channels, child.kernel_size,
+                            child.stride, child.padding, child.dilation, child.groups, 
+                            child.bias is not None, 
+                            num_tasks=num_tasks, nbits_high=8, nbits_low=4
+                        )
+                    elif isinstance(child, nn.Linear):
+                        new_layer = MixedLinearLSQ(
+                            child.in_features, child.out_features, child.bias is not None,
+                            num_tasks=num_tasks, nbits_high=8, nbits_low=4
+                        )
+                    
+                    if new_layer:
+                        # 1. 复制权重
+                        new_layer.load_state_dict(child.state_dict(), strict=False)
+                        # 2. 注入 Mask
+                        new_layer.weight_mask = mask
+                        # 3. 部署到设备
+                        new_layer = new_layer.to(device)
+                        
+                        setattr(module, name, new_layer)
+                        replaced_count += 1
+                
+                else:
+                    _replace_recursive(child, full_name)
+
+        _replace_recursive(self)
+        print_log(f"成功替换 {replaced_count} 层为混合精度层。", logger='root')
+
     def set_task(self, task_id):
         for module in self.modules():
             if hasattr(module, 'change_buffer'):
@@ -622,11 +797,19 @@ class MTL(BaseModule):
         losses.update(loss)
         return losses
 
+    # def forward_train_det(self, img, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore=None):
+    #     if img_metas and 'batch_input_shape' not in img_metas[0]:
+    #          for img_meta in img_metas: img_meta['batch_input_shape'] = tuple(img.size()[-2:])
+    #     x = self.extract_feat(img)[0]
+    #     losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore, self.shared_encoder)
+    #     return losses
+    # [修改] 解耦检测任务调用
     def forward_train_det(self, img, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore=None):
         if img_metas and 'batch_input_shape' not in img_metas[0]:
              for img_meta in img_metas: img_meta['batch_input_shape'] = tuple(img.size()[-2:])
         x = self.extract_feat(img)[0]
-        losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore, self.shared_encoder)
+        # [修改] 不再传入 self.shared_encoder
+        losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore)
         return losses
 
     def forward_train_seg(self, img, img_metas, gt_semantic_seg):
@@ -645,12 +828,22 @@ class MTL(BaseModule):
         res = self.cls_head.simple_test(neck_feature, backbone_feature, self.shared_encoder, img_metas=img_metas, **kwargs)
         return res
 
+    # def simple_test_det(self, img, img_metas, rescale=False):
+    #     if img.dim() == 3: img = img.unsqueeze(0)
+    #     if img_metas and 'batch_input_shape' not in img_metas[0]:
+    #          for img_meta in img_metas: img_meta['batch_input_shape'] = tuple(img.size()[-2:])
+    #     feat = self.extract_feat(img)[0]
+    #     results_list = self.bbox_head.simple_test(feat, img_metas, rescale=rescale, shared_encoder=self.shared_encoder)
+    #     bbox_results = [bbox2result(det_bboxes, det_labels, self.bbox_head.num_classes) for det_bboxes, det_labels in results_list]
+    #     return bbox_results
+    # [修改] 解耦检测任务调用
     def simple_test_det(self, img, img_metas, rescale=False):
         if img.dim() == 3: img = img.unsqueeze(0)
         if img_metas and 'batch_input_shape' not in img_metas[0]:
              for img_meta in img_metas: img_meta['batch_input_shape'] = tuple(img.size()[-2:])
         feat = self.extract_feat(img)[0]
-        results_list = self.bbox_head.simple_test(feat, img_metas, rescale=rescale, shared_encoder=self.shared_encoder)
+        # [修改] 不再传入 self.shared_encoder
+        results_list = self.bbox_head.simple_test(feat, img_metas, rescale=rescale)
         bbox_results = [bbox2result(det_bboxes, det_labels, self.bbox_head.num_classes) for det_bboxes, det_labels in results_list]
         return bbox_results
 

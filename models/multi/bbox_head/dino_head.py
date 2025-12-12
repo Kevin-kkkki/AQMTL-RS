@@ -53,13 +53,41 @@ class DINOHead(DeformableDETRHead):
             dn_cfg['hidden_dim'] = self.embed_dims
         self.dn_generator = build_dn_generator(dn_cfg)
 
+    # def forward_train(self,
+    #                   mlvl_feats,
+    #                   img_metas,
+    #                   gt_bboxes,
+    #                   gt_labels=None,
+    #                   gt_bboxes_ignore=None,
+    #                   shared_encoder=None,
+    #                   proposal_cfg=None,
+    #                   **kwargs):
+    #     assert proposal_cfg is None, '"proposal_cfg" must be None'
+    #     assert self.dn_generator is not None, '"dn_cfg" must be set'
+    #     dn_label_query, dn_bbox_query, attn_mask, dn_meta = \
+    #         self.dn_generator(gt_bboxes, gt_labels,
+    #                           self.label_embedding, img_metas)
+    #     outs = self(shared_encoder, mlvl_feats, img_metas,
+    #                 dn_label_query, dn_bbox_query, attn_mask)
+    #     if gt_labels is None:
+    #         loss_inputs = outs + (gt_bboxes, img_metas, dn_meta)
+    #     else:
+    #         loss_inputs = outs + (gt_bboxes, gt_labels, img_metas, dn_meta)
+    #     losses = self.loss(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
+    #     return losses
+
+    # def simple_test(self, feats, img_metas, shared_encoder=None, rescale=False):
+    #     outs = self.forward(shared_encoder, feats, img_metas)
+    #     results_list = self.get_bboxes(*outs, img_metas, rescale=rescale)
+    #     return results_list
+
     def forward_train(self,
                       mlvl_feats,
                       img_metas,
                       gt_bboxes,
                       gt_labels=None,
                       gt_bboxes_ignore=None,
-                      shared_encoder=None,
+                      # shared_encoder=None,  <-- [删除]
                       proposal_cfg=None,
                       **kwargs):
         assert proposal_cfg is None, '"proposal_cfg" must be None'
@@ -67,8 +95,11 @@ class DINOHead(DeformableDETRHead):
         dn_label_query, dn_bbox_query, attn_mask, dn_meta = \
             self.dn_generator(gt_bboxes, gt_labels,
                               self.label_embedding, img_metas)
-        outs = self(shared_encoder, mlvl_feats, img_metas,
+        
+        # [修改] 调用 forward 时不再传入 shared_encoder
+        outs = self(mlvl_feats, img_metas,
                     dn_label_query, dn_bbox_query, attn_mask)
+                    
         if gt_labels is None:
             loss_inputs = outs + (gt_bboxes, img_metas, dn_meta)
         else:
@@ -76,13 +107,22 @@ class DINOHead(DeformableDETRHead):
         losses = self.loss(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
         return losses
 
-    def simple_test(self, feats, img_metas, shared_encoder=None, rescale=False):
-        outs = self.forward(shared_encoder, feats, img_metas)
+    def simple_test(self, feats, img_metas, rescale=False): # [删除] shared_encoder=None
+        # [修改] 不再传入 shared_encoder
+        outs = self.forward(feats, img_metas)
         results_list = self.get_bboxes(*outs, img_metas, rescale=rescale)
         return results_list
 
+    # def forward(self,
+    #             encoder,
+    #             mlvl_feats,
+    #             img_metas,
+    #             dn_label_query=None,
+    #             dn_bbox_query=None,
+    #             attn_mask=None):
+    #     batch_size = mlvl_feats[0].size(0)
     def forward(self,
-                encoder,
+                # encoder,  <-- [删除]
                 mlvl_feats,
                 img_metas,
                 dn_label_query=None,
@@ -105,7 +145,22 @@ class DINOHead(DeformableDETRHead):
             mlvl_positional_encodings.append(
                 self.positional_encoding(mlvl_masks[-1]))
 
+        # query_embeds = None
+        # hs, inter_references, topk_score, topk_anchor = \
+        #     self.transformer(
+        #         mlvl_feats,
+        #         mlvl_masks,
+        #         query_embeds,
+        #         mlvl_positional_encodings,
+        #         dn_label_query,
+        #         dn_bbox_query,
+        #         attn_mask,
+        #         encoder,  # Modification
+        #         reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
+        #         cls_branches=self.cls_branches if self.as_two_stage else None  # noqa:E501
+        #     )
         query_embeds = None
+        # [修改] 调用 transformer 时移除 encoder 参数
         hs, inter_references, topk_score, topk_anchor = \
             self.transformer(
                 mlvl_feats,
@@ -115,9 +170,9 @@ class DINOHead(DeformableDETRHead):
                 dn_label_query,
                 dn_bbox_query,
                 attn_mask,
-                encoder,  # Modification
-                reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
-                cls_branches=self.cls_branches if self.as_two_stage else None  # noqa:E501
+                # encoder, <-- [删除]
+                reg_branches=self.reg_branches if self.with_box_refine else None,
+                cls_branches=self.cls_branches if self.as_two_stage else None
             )
         hs = hs.permute(0, 2, 1, 3)
 

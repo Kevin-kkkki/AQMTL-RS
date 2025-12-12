@@ -8,7 +8,6 @@ if project_root not in sys.path:
 
 import argparse
 import os
-import os.path as osp
 import sys
 import warnings
 import torch
@@ -19,12 +18,6 @@ from mmdet.datasets import build_dataloader
 from mmdet.models import build_detector
 from typing import List
 import mmcv
-import os.path as osp
-
-# --- 1. 路径与注册修复 (HARD FIX) ---
-project_root = osp.dirname(osp.dirname(osp.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
 
 # --- 2. 导入项目内部模块 ---
 try:
@@ -38,8 +31,6 @@ except ImportError as e:
     print(f"Warning: Import failed or modules already loaded: {e}")
 
 # --- 自定义测试 Runner ---
-# --- tools/test_quant.py ---
-
 def unwrap_img_metas(data_item):
     """递归解包 img_metas，直到拿到真正的 list"""
     if hasattr(data_item, 'data'):
@@ -70,16 +61,12 @@ def custom_test_runner(model, data_loader, task_name, dataset_name=None, show=Fa
         
         if show or out_dir:
             if 'img_metas' in data:
-                # 使用辅助函数安全获取
                 img_metas = unwrap_img_metas(data['img_metas'])
-                
-                # 确保 img_metas 是列表且不为空
                 if not isinstance(img_metas, list):
                     img_metas = [img_metas]
 
                 for j, output in enumerate(outputs):
                     if j >= len(img_metas): break
-                        
                     img_meta = img_metas[j]
                     img_path = img_meta['filename']
                     
@@ -89,43 +76,24 @@ def custom_test_runner(model, data_loader, task_name, dataset_name=None, show=Fa
                         out_file = osp.join(out_dir, file_name)
                     
                     try:
-                        # --- 核心修改：显式传入 task_name 和 dataset_name ---
                         model_to_eval.show_result(
                             img_path,
                             output,
-                            task_name=task_name,        # 明确任务类型 ('cls', 'det', 'seg')
-                            dataset_name=dataset_name,  # 明确数据集 ('resisc', 'dior', ...)
+                            task_name=task_name,
+                            dataset_name=dataset_name,
                             show=show,
                             out_file=out_file,
                             score_thr=0.3 
                         )
                     except Exception as e:
-                        # --- 核心修改：打印错误而不是忽略 ---
-                        # 为了不刷屏，只打印前几次错误
                         if i < 5: 
                             print(f"\n[Error] Vis failed for {osp.basename(img_path)}: {e}")
                         pass
 
         prog_bar.update(len(data['img_metas']))
     return results
-# def custom_test_runner(model, data_loader, task_name, show=False, out_dir=None):
-#     model_to_eval = model.module if hasattr(model, 'module') else model
-#     model_to_eval.eval() 
-    
-#     results = []
-#     from mmcv.utils import ProgressBar
-#     prog_bar = ProgressBar(len(data_loader.dataset))
-    
-#     for i, data in enumerate(data_loader):
-#         with torch.no_grad():
-#             data['task'] = task_name 
-#             # forward_test
-#             outputs = model(return_loss=False, rescale=True, **data)
-#         results.extend(outputs)
-#         prog_bar.update(len(data['img_metas']))
-#     return results
 
-# --- 指标筛选器 (修复了 args 作用域问题) ---
+# --- 指标筛选器 ---
 def get_task_metrics(task_type: str, eval_args: List[str]):
     if not eval_args:
         return None
@@ -133,28 +101,22 @@ def get_task_metrics(task_type: str, eval_args: List[str]):
     lower_args = [m.lower() for m in eval_args]
     
     if task_type == 'cls':
-        # 分类通常使用 'accuracy' (小写)
         metrics = []
-        if any('acc' in m for m in lower_args):
-            metrics.append('accuracy')
+        if any('acc' in m for m in lower_args): metrics.append('accuracy')
         if any('top' in m for m in lower_args):
              if 'accuracy' not in metrics: metrics.append('accuracy')
         return metrics if metrics else ['accuracy']
 
     elif task_type == 'det':
-        # 检测使用 'bbox' (小写)
         metrics = []
         if any('bbox' in m for m in lower_args) or any('map' in m for m in lower_args):
             metrics.append('bbox')
         return metrics if metrics else ['bbox']
 
     elif task_type == 'seg':
-        # 【关键修复】 分割必须返回 'mIoU', 'mFscore' (注意大小写)
         metrics = []
-        if any('iou' in m for m in lower_args):
-            metrics.append('mIoU')     # <--- 必须是 mIoU
-        if any('fscore' in m for m in lower_args):
-            metrics.append('mFscore')  # <--- 必须是 mFscore
+        if any('iou' in m for m in lower_args): metrics.append('mIoU')
+        if any('fscore' in m for m in lower_args): metrics.append('mFscore')
         return metrics if metrics else ['mIoU']
         
     return eval_args
@@ -186,21 +148,48 @@ def main():
         
     cfg.model.pretrained = None
 
-    # 1. 构建模型
+    # 1. 构建模型 (FP32 结构)
     print(f"Building model from config...")
     model = build_detector(cfg.model, train_cfg=None, test_cfg=cfg.get('test_cfg'))
     
-    # 2. 应用量化结构
+    # =============================================================================
+    # 2. 【核心修改】自动检测并恢复量化结构 (混合精度 or 均匀量化)
+    # =============================================================================
     if cfg.get('quantize', False):
-        print("\n[Test] Applying TSQ-MTC Quantization Structure...")
-        if hasattr(model, 'apply_quantization'):
-            model.apply_quantization(num_tasks=3)
-        elif hasattr(model, 'module') and hasattr(model.module, 'apply_quantization'):
-            model.module.apply_quantization(num_tasks=3)
-        print("[Test] Quantization layers applied.")
+        print("\n[Test] Checking Quantization Strategy...")
+        
+        # 策略：尝试在 checkpoint 所在的目录下寻找 'fine_grained_mask.pth'
+        # 假设: checkpoint = work_dirs/exp1/best.pth, mask = work_dirs/exp1/fine_grained_mask.pth
+        ckpt_dir = osp.dirname(args.checkpoint)
+        mask_file = osp.join(ckpt_dir, 'fine_grained_mask.pth')
+        
+        if osp.exists(mask_file):
+            print(f"[Test] Found Fine-Grained Mask at: {mask_file}")
+            print("[Test] Restoring Mixed Precision Structure (Phase 2)...")
+            
+            if hasattr(model, 'apply_fine_grained_quantization'):
+                # 这一步会将 Linear/Conv2d 替换为 MixedLinearLSQ/MixedConv2dLSQ
+                model.apply_fine_grained_quantization(mask_file, num_tasks=3)
+            elif hasattr(model, 'module') and hasattr(model.module, 'apply_fine_grained_quantization'):
+                model.module.apply_fine_grained_quantization(mask_file, num_tasks=3)
+            else:
+                print("[Warning] Model does not support fine-grained quantization method!")
+                
+        else:
+            print(f"[Test] No mask found at {mask_file}.")
+            print("[Test] Falling back to Standard TSQ-MTC Quantization (Uniform)...")
+            # 回退到均匀量化结构 (LinearLSQ/Conv2dLSQ)
+            if hasattr(model, 'apply_quantization'):
+                model.apply_quantization(num_tasks=3)
+            elif hasattr(model, 'module') and hasattr(model.module, 'apply_quantization'):
+                model.module.apply_quantization(num_tasks=3)
+        
+        print("[Test] Quantization layers restoration completed.")
+    # =============================================================================
     
     # 3. 加载权重
     print(f"[Test] Loading checkpoint from {args.checkpoint}...")
+    # 此时模型结构已经变成了 MixedLSQ (如果是混合精度)，权重可以正确匹配
     load_checkpoint(model, args.checkpoint, map_location='cpu')
 
     # 4. DataParallel
@@ -213,7 +202,6 @@ def main():
     for dataset_name, dataset in datasets_dict.items():
         print(f"\n\n{'='*20} Testing Task: {dataset_name} {'='*20}")
         
-        # 获取任务类型
         if hasattr(dataset, 'task'):
             task_type = dataset.task
         else:
@@ -222,7 +210,6 @@ def main():
             elif 'potsdam' in dataset_name: task_type = 'seg'
             else: task_type = 'cv'
             
-        # 获取 DataLoader 配置
         task_config_dict = cfg.data.get(dataset_name)
         workers_per_gpu_val = 2
         if task_config_dict and 'config' in task_config_dict:
@@ -238,36 +225,29 @@ def main():
             dist=False,
             shuffle=False)
         
-        # ================== 【修改点：构造分任务的可视化目录】 ==================
         task_out_dir = None
         if args.show_dir:
-            # 自动拼接子目录，例如: work_dirs/vis_results/dior
             task_out_dir = osp.join(args.show_dir, dataset_name)
             print(f"[Visualizer] Results for {dataset_name} will be saved to: {task_out_dir}")
-        # ====================================================================
 
-        # --- 运行推理 ---
         outputs = custom_test_runner(
             model, 
             data_loader, 
             task_name=task_type,
             dataset_name=dataset_name,
             show=args.show, 
-            out_dir=task_out_dir  # <--- 这里传入的是子目录，而不是 args.show_dir
+            out_dir=task_out_dir
         )
 
-        # 保存结果文件 (.pkl)
         if args.out:
             import mmcv 
             out_file = args.out
             if len(datasets_dict) > 1:
                 base, ext = os.path.splitext(out_file)
                 out_file = f"{base}_{dataset_name}{ext}"
-                
             print(f'\nwriting results to {out_file}')
             mmcv.dump(outputs, out_file)
         
-        # --- 准备评估 ---
         metrics = None
         if args.eval:
             metrics = get_task_metrics(task_type, args.eval)
@@ -298,6 +278,9 @@ def main():
                 traceback.print_exc()
         else:
             print(f"Skipping evaluation for {dataset_name}: No metrics found.")
+
+if __name__ == '__main__':
+    main()
 
 # def main():
 #     args = parse_args()

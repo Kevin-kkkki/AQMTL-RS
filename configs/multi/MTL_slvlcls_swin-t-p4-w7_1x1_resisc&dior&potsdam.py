@@ -71,6 +71,23 @@ model = dict(
             group_cfg=dict(dynamic=True, num_groups=None, num_dn_queries=100)),
         transformer=dict(
             type='DinoTransformer',
+            encoder=dict(
+                type='DetrTransformerEncoder',
+                num_layers=6,
+                transformerlayers=dict(
+                    type='BaseTransformerLayer',
+                    attn_cfgs=dict(
+                        type='MultiScaleDeformableAttention',
+                        embed_dims=256,
+                        num_levels=4,
+                        dropout=0.0),
+                    ffn_cfgs=dict(
+                        type='FFN',
+                        feedforward_channels=2048,
+                        num_fcs=2,
+                        ffn_drop=0.0,
+                        act_cfg=dict(type='ReLU', inplace=True)),
+                    operation_order=('self_attn', 'norm', 'ffn', 'norm'))),
             decoder=dict(
                 type='DinoTransformerDecoder',
                 num_layers=6,
