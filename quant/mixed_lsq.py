@@ -36,41 +36,52 @@ class MixedConv2dLSQ(_Conv2dQ):
         Qn_h, Qp_h = -2**(self.nbits_high-1), 2**(self.nbits_high-1)-1
         Qn_l, Qp_l = -2**(self.nbits_low-1), 2**(self.nbits_low-1)-1
 
+        # 2. 初始化逻辑
         if self.training and self.init_state_mixed == 0:
-            mask_bool = self.weight_mask.bool()
-            w_h = self.weight[mask_bool]
-            w_l = self.weight[~mask_bool]
+            # [关键修复] Mask 也必须展平为 1D，才能和 weight_flat 匹配
+            mask_bool = self.weight_mask.view(-1).bool()
             
-            # [Fix 2] 即使部分为空，也用整体均值兜底初始化，防止 alpha 保持为 1.0 可能过大
+            # 权重展平为 1D
+            weight_flat = self.weight.view(-1)
+            
+            # 现在两个都是 1D，可以安全索引了
+            w_h = weight_flat[mask_bool]
+            w_l = weight_flat[~mask_bool]
+            
+            # ... (后续 Alpha 初始化代码保持不变) ...
             mean_abs = self.weight.abs().mean()
             if w_h.numel() > 0:
                 self.alpha_high.data.copy_(2 * w_h.abs().mean() / math.sqrt(Qp_h))
             else:
-                self.alpha_high.data.copy_(2 * mean_abs / math.sqrt(Qp_h)) # Fallback
+                self.alpha_high.data.copy_(2 * mean_abs / math.sqrt(Qp_h))
                 
             if w_l.numel() > 0:
                 self.alpha_low.data.copy_(2 * w_l.abs().mean() / math.sqrt(Qp_l))
             else:
-                self.alpha_low.data.copy_(2 * mean_abs / math.sqrt(Qp_l)) # Fallback
+                self.alpha_low.data.copy_(2 * mean_abs / math.sqrt(Qp_l))
 
             self.init_state_mixed.fill_(1)
 
         g_h = 1.0 / math.sqrt(self.weight.numel() * Qp_h)
         g_l = 1.0 / math.sqrt(self.weight.numel() * Qp_l)
         
-        # [Fix 3] 强力 Clamp，防止除以 0 或极小值
+        # Alpha reshape (Conv2d: 4D)
         alpha_h = grad_scale(self.alpha_high, g_h).view(-1, 1, 1, 1).abs().clamp(min=1e-5)
         alpha_l = grad_scale(self.alpha_low, g_l).view(-1, 1, 1, 1).abs().clamp(min=1e-5)
 
+        # 3. 量化计算
         w_q_h = round_pass((self.weight / alpha_h).clamp(Qn_h, Qp_h)) * alpha_h
         w_q_l = round_pass((self.weight / alpha_l).clamp(Qn_l, Qp_l)) * alpha_l
         
-        w_mixed = w_q_h * self.weight_mask + w_q_l * (1 - self.weight_mask)
+        # 应用 Mask (这里 view_as 会自动处理，确保是 4D)
+        mask_reshaped = self.weight_mask.view_as(self.weight)
+        
+        w_mixed = w_q_h * mask_reshaped + w_q_l * (1 - mask_reshaped)
 
         x = F.conv2d(x, w_mixed, self.bias, self.stride, self.padding, self.dilation, self.groups)
         x = self.act(x)
         return x
-
+    
 class MixedLinearLSQ(_LinearQ):
     def __init__(self, in_features, out_features, bias=True, 
                  num_tasks=3, nbits_high=8, nbits_low=4, nbits_a=4, **kwargs):
@@ -93,18 +104,25 @@ class MixedLinearLSQ(_LinearQ):
         self.act = _ActQ(in_features=out_features, num_tasks=num_tasks, nbits=nbits_a)
 
     def forward(self, x):
+        # 1. 如果没有 Mask，走普通线性层逻辑
         if self.weight_mask is None:
             return F.linear(x, self.weight, self.bias)
 
         Qn_h, Qp_h = -2**(self.nbits_high-1), 2**(self.nbits_high-1)-1
         Qn_l, Qp_l = -2**(self.nbits_low-1), 2**(self.nbits_low-1)-1
 
+        # 2. 初始化逻辑
         if self.training and self.init_state_mixed == 0:
-            mask_bool = self.weight_mask.bool()
-            w_h = self.weight[mask_bool]
-            w_l = self.weight[~mask_bool]
+            # [关键修复 1] Mask 必须展平为 1D，才能索引 1D 的 weight_flat
+            mask_bool = self.weight_mask.view(-1).bool()
             
-            # [Fix 2] Fallback 初始化
+            # 权重展平为 1D
+            weight_flat = self.weight.view(-1)
+            
+            w_h = weight_flat[mask_bool]
+            w_l = weight_flat[~mask_bool]
+            
+            # 初始化 Alpha
             mean_abs = self.weight.abs().mean()
             if w_h.numel() > 0:
                 self.alpha_high.data.copy_(2 * w_h.abs().mean() / math.sqrt(Qp_h))
@@ -121,14 +139,18 @@ class MixedLinearLSQ(_LinearQ):
         g_h = 1.0 / math.sqrt(self.weight.numel() * Qp_h)
         g_l = 1.0 / math.sqrt(self.weight.numel() * Qp_l)
         
-        # [Fix 3] 强力 Clamp
+        # 强力 Clamp
         alpha_h = grad_scale(self.alpha_high, g_h).view(-1, 1).abs().clamp(min=1e-5)
         alpha_l = grad_scale(self.alpha_low, g_l).view(-1, 1).abs().clamp(min=1e-5)
         
+        # 3. 量化计算
         w_q_h = round_pass((self.weight / alpha_h).clamp(Qn_h, Qp_h)) * alpha_h
         w_q_l = round_pass((self.weight / alpha_l).clamp(Qn_l, Qp_l)) * alpha_l
         
-        w_mixed = w_q_h * self.weight_mask + w_q_l * (1 - self.weight_mask)
+        # [关键修复 2] 应用 Mask 时，将 Mask 变形为与权重一致的 2D 形状
+        mask_reshaped = self.weight_mask.view_as(self.weight)
+        
+        w_mixed = w_q_h * mask_reshaped + w_q_l * (1 - mask_reshaped)
         
         x = F.linear(x, w_mixed, self.bias)
         x = self.act(x)

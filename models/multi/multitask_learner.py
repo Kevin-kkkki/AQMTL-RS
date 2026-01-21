@@ -112,23 +112,46 @@ class MTL(BaseModule):
 
     def generate_fine_grained_mask(self, data_loader, save_path='fine_grained_mask.pth', ratio_high=0.05, default_task='cls'):
         """
-        Phase 1: 计算重要性得分。
-        【策略升级】: 实施 4 组独立排序 (Shared, CLS, DET, SEG)。
-        这能确保检测任务的新独立 Encoder 获得足够的高精度权重，同时不影响其他任务。
+        [Phase 1] TACQ 风格的敏感度分析与 Mask 生成
+        修改: 支持不同任务头使用不同的 8-bit 保留比例。
+        配置: Shared=10%, CLS=5%, DET=20%, SEG=5%
         """
         from mmcv.utils import print_log
-        print_log(f"\n[Phase 1] 正在生成细粒度混合精度 Mask...", logger='root')
-        print_log(f"策略: 4组独立排序 (Shared/CLS/DET/SEG)，Top {ratio_high*100}% 保留 8-bit。", logger='root')
+        import math
         
-        # 1. 计算梯度 (Calibration)
+        # ================= [修改点 1] 定义各组的量化比例配置 =================
+        group_ratios = {
+            'shared': 0.40,    # 共享编码器: 40%
+            'cls_head': 0.05,  # 分类任务: 5%
+            'det_head': 0.15,  # 目标检测: 15%
+            'seg_head': 0.05   # 分割任务: 5%
+        }
+        # =================================================================
+        
+        print_log(f"\n{'='*20} [Phase 1] Starting TACQ Sensitivity Analysis {'='*20}", logger='root')
+        print_log(f"混合精度策略配置 (Target 8-bit Ratios): {group_ratios}", logger='root')
+
+        # 1. 初始化梯度累加器
         self.eval()
         self.zero_grad()
         device = next(self.parameters()).device
         
-        # 运行少量 Batch
-        for i, data in enumerate(data_loader):
-            if i >= 2: break 
+        accumulated_grads = {}
+        target_modules = (nn.Conv2d, nn.Linear)
+        
+        for name, module in self.named_modules():
+            if isinstance(module, target_modules) and module.weight.requires_grad:
+                accumulated_grads[name] = torch.zeros_like(module.weight.data)
+
+        # 2. 梯度累积循环
+        print_log("正在进行多任务梯度累积 (Gradient Accumulation)...", logger='root')
+        
+        max_steps = 15 
+        
+        for step, data in enumerate(data_loader):
+            if step >= max_steps: break
             
+            # 解包数据
             unpacked_data = {}
             for k, v in data.items():
                 if 'DataContainer' in str(type(v)): obj = v.data[0]
@@ -137,87 +160,87 @@ class MTL(BaseModule):
                 elif isinstance(obj, list): obj = [x.to(device) if isinstance(x, torch.Tensor) else x for x in obj]
                 unpacked_data[k] = obj
             
-            if 'task' not in unpacked_data: unpacked_data['task'] = default_task
+            if 'task' not in unpacked_data:
+                unpacked_data['task'] = default_task
             
             with torch.enable_grad():
                 losses = self(**unpacked_data)
                 loss, _ = self._parse_losses(losses)
                 loss.backward()
-        
-        print_log("梯度计算完成，开始分组计算得分...", logger='root')
+            
+            for name, module in self.named_modules():
+                if name in accumulated_grads and module.weight.grad is not None:
+                    accumulated_grads[name] += module.weight.grad.data.abs()
+            
+            self.zero_grad()
 
-        # 2. 定义分组容器
+        print_log("梯度累积完成。开始计算 TACQ 得分...", logger='root')
+
+        # 3. 计算 TACQ 得分并分组
         scores_dict = {
-            'shared': [],
-            'cls_head': [],
-            'det_head': [],
-            'seg_head': []
+            'shared': [], 'cls_head': [], 'det_head': [], 'seg_head': []
         }
-        
         layer_map = {} 
         layer_scores = {}
-
-        skip_keywords = ['fc_reg', 'fc_cls', 'bbox_pred', 'mask_embed'] 
+        
+        skip_keywords = ['fc_reg', 'fc_cls', 'bbox_pred', 'mask_embed', 'norm', 'bias']
 
         for name, module in self.named_modules():
             if any(k in name for k in skip_keywords): continue
+            if name not in accumulated_grads: continue
             
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                if module.weight.grad is None: continue
-                
-                # Metric: |W| * |Grad|
-                score = module.weight.data.abs() * module.weight.grad.data.abs()
-                layer_scores[name] = score
-                
-                # ========================================================
-                # 【关键逻辑】 智能分组 (4组)
-                # ========================================================
-                group_name = 'shared' # 默认
-                
-                if name.startswith('cls_head'):
-                    group_name = 'cls_head'
-                
-                elif name.startswith('bbox_head'):
-                    # 包含: 检测头本身 + 新增的独立 Encoder (现在都在 bbox_head 下)
-                    group_name = 'det_head'
-                
-                elif name.startswith('seg_head'):
-                    group_name = 'seg_head'
-                
-                elif any(name.startswith(p) for p in ['backbone', 'neck', 'shared_encoder']):
-                    # Shared Encoder 现在只服务 CLS/SEG，归类为共享组
-                    group_name = 'shared'
-                
-                scores_dict[group_name].append(score.view(-1))
-                layer_map[name] = group_name
+            sum_grad = accumulated_grads[name]
+            
+            if sum_grad.max() <= 1e-9:
+                score = torch.zeros_like(module.weight.data).view(-1)
+            else:
+                w = module.weight.data
+                w_abs = w.abs()
+                Qp = 2**(4-1) - 1
+                scale = w_abs.max() / Qp
+                scale = torch.max(scale, torch.tensor(1e-5, device=device))
+                w_quant = (w / scale).round().clamp(-Qp, Qp) * scale
+                term_error = (w - w_quant).abs()
+                score = w_abs * sum_grad * term_error
+                score = score.view(-1)
 
-        # 3. 分别计算各组阈值
+            layer_scores[name] = score
+
+            group_name = 'shared'
+            if name.startswith('cls_head'): group_name = 'cls_head'
+            elif name.startswith('bbox_head'): group_name = 'det_head'
+            elif name.startswith('seg_head'): group_name = 'seg_head'
+            
+            scores_dict[group_name].append(score)
+            layer_map[name] = group_name
+
+        # 4. 计算各组阈值
         def get_threshold(score_list, ratio):
             if not score_list: return float('inf')
-            all_s = torch.cat(score_list) 
+            all_s = torch.cat(score_list)
+            if all_s.max() <= 1e-9: return float('inf')
+            
             k = int(all_s.numel() * ratio)
             if k < 1: k = 1
             return torch.topk(all_s, k)[0][-1]
 
         thresholds = {}
-        print_log(f"{'-'*40}", logger='root')
         for group, scores in scores_dict.items():
-            thresholds[group] = get_threshold(scores, ratio_high)
-            print_log(f"Threshold [{group:<10}]: {thresholds[group]:.4e} (Params: {sum(s.numel() for s in scores)})", logger='root')
-        print_log(f"{'-'*40}", logger='root')
+            # ================= [修改点 2] 动态读取不同组的比例 =================
+            current_ratio = group_ratios.get(group, ratio_high)
+            # ===============================================================
+            
+            thresholds[group] = get_threshold(scores, current_ratio)
+            print_log(f"Group [{group}] Ratio: {current_ratio*100}% | Threshold: {thresholds[group]:.4e}", logger='root')
 
-        # 4. 生成并保存 Mask
+        # 5. 保存 Mask
         mask_dict = {}
         total_params = 0
         total_8bit = 0
         
         for name, score in layer_scores.items():
             if name not in layer_map: continue
-            
-            group = layer_map[name]
-            thresh = thresholds[group]
-            
-            # 生成 0/1 Mask
+            thresh = thresholds[layer_map[name]]
             mask = (score >= thresh).float()
             
             mask_dict[name] = mask.cpu()
@@ -226,7 +249,143 @@ class MTL(BaseModule):
 
         print_log(f"Mask 生成完毕。全局 8-bit 比例: {total_8bit/total_params*100:.2f}%", logger='root')
         torch.save(mask_dict, save_path)
-        print_log(f"Mask 已保存至: {save_path}", logger='root')
+    # def generate_fine_grained_mask(self, data_loader, save_path='fine_grained_mask.pth', ratio_high=0.05, default_task='cls'):
+    #     """
+    #     Phase 1: 计算重要性得分。
+    #     【策略升级】: 实施 4 组独立排序 (Shared, CLS, DET, SEG)。
+    #     这能确保检测任务的新独立 Encoder 获得足够的高精度权重，同时不影响其他任务。
+    #     """
+    #     from mmcv.utils import print_log
+    #     print_log(f"\n[Phase 1] 正在生成细粒度混合精度 Mask...", logger='root')
+    #     print_log(f"策略: 4组独立排序 (Shared/CLS/DET/SEG)，Top {ratio_high*100}% 保留 8-bit。", logger='root')
+        
+    #     # 1. 计算梯度 (Calibration)
+    #     self.eval()
+    #     self.zero_grad()
+    #     device = next(self.parameters()).device
+        
+    #     # 运行少量 Batch
+    #     for i, data in enumerate(data_loader):
+    #         if i >= 2: break 
+            
+    #         unpacked_data = {}
+    #         for k, v in data.items():
+    #             if 'DataContainer' in str(type(v)): obj = v.data[0]
+    #             else: obj = v
+    #             if isinstance(obj, torch.Tensor): obj = obj.to(device)
+    #             elif isinstance(obj, list): obj = [x.to(device) if isinstance(x, torch.Tensor) else x for x in obj]
+    #             unpacked_data[k] = obj
+            
+    #         if 'task' not in unpacked_data: unpacked_data['task'] = default_task
+            
+    #         with torch.enable_grad():
+    #             losses = self(**unpacked_data)
+    #             loss, _ = self._parse_losses(losses)
+    #             loss.backward()
+        
+    #     print_log("梯度计算完成，开始分组计算得分...", logger='root')
+
+    #     # 2. 定义分组容器
+    #     scores_dict = {
+    #         'shared': [],
+    #         'cls_head': [],
+    #         'det_head': [],
+    #         'seg_head': []
+    #     }
+        
+    #     layer_map = {} 
+    #     layer_scores = {}
+
+    #     skip_keywords = ['fc_reg', 'fc_cls', 'bbox_pred', 'mask_embed'] 
+
+    #     for name, module in self.named_modules():
+    #         if any(k in name for k in skip_keywords): continue
+            
+    #         if isinstance(module, (nn.Conv2d, nn.Linear)):
+    #             # [修改] 强制处理无梯度层
+    #             if module.weight.grad is None:
+    #                 # 如果层是可训练的 (requires_grad=True) 但没有梯度 (grad is None)，
+    #                 # 说明它是其他任务的层（例如检测头/分割头）。
+    #                 # 我们将其重要性设为 0，从而强制它被分配为 4-bit (低精度)。
+    #                 if module.weight.requires_grad:
+    #                     score = torch.zeros_like(module.weight.data).view(-1)
+    #                 else:
+    #                     # 如果是真的被冻结的层 (Backbone Frozen Stages)，则跳过
+    #                     continue
+    #             else:
+    #                 # 正常情况：有梯度，计算重要性 |W| * |Grad|
+    #                 score = module.weight.data.abs() * module.weight.grad.data.abs()
+                
+    #             # 记录分数
+    #             layer_scores[name] = score
+    #     # for name, module in self.named_modules():
+    #     #     if any(k in name for k in skip_keywords): continue
+            
+    #     #     if isinstance(module, (nn.Conv2d, nn.Linear)):
+    #     #         if module.weight.grad is None: continue
+                
+    #     #         # Metric: |W| * |Grad|
+    #     #         score = module.weight.data.abs() * module.weight.grad.data.abs()
+    #     #         layer_scores[name] = score
+                
+    #             # ========================================================
+    #             # 【关键逻辑】 智能分组 (4组)
+    #             # ========================================================
+    #             group_name = 'shared' # 默认
+                
+    #             if name.startswith('cls_head'):
+    #                 group_name = 'cls_head'
+                
+    #             elif name.startswith('bbox_head'):
+    #                 # 包含: 检测头本身 + 新增的独立 Encoder (现在都在 bbox_head 下)
+    #                 group_name = 'det_head'
+                
+    #             elif name.startswith('seg_head'):
+    #                 group_name = 'seg_head'
+                
+    #             elif any(name.startswith(p) for p in ['backbone', 'neck', 'shared_encoder']):
+    #                 # Shared Encoder 现在只服务 CLS/SEG，归类为共享组
+    #                 group_name = 'shared'
+                
+    #             scores_dict[group_name].append(score.view(-1))
+    #             layer_map[name] = group_name
+
+    #     # 3. 分别计算各组阈值
+    #     def get_threshold(score_list, ratio):
+    #         if not score_list: return float('inf')
+    #         all_s = torch.cat(score_list) 
+    #         k = int(all_s.numel() * ratio)
+    #         if k < 1: k = 1
+    #         return torch.topk(all_s, k)[0][-1]
+
+    #     thresholds = {}
+    #     print_log(f"{'-'*40}", logger='root')
+    #     for group, scores in scores_dict.items():
+    #         thresholds[group] = get_threshold(scores, ratio_high)
+    #         print_log(f"Threshold [{group:<10}]: {thresholds[group]:.4e} (Params: {sum(s.numel() for s in scores)})", logger='root')
+    #     print_log(f"{'-'*40}", logger='root')
+
+    #     # 4. 生成并保存 Mask
+    #     mask_dict = {}
+    #     total_params = 0
+    #     total_8bit = 0
+        
+    #     for name, score in layer_scores.items():
+    #         if name not in layer_map: continue
+            
+    #         group = layer_map[name]
+    #         thresh = thresholds[group]
+            
+    #         # 生成 0/1 Mask
+    #         mask = (score >= thresh).float()
+            
+    #         mask_dict[name] = mask.cpu()
+    #         total_params += mask.numel()
+    #         total_8bit += mask.sum().item()
+
+    #     print_log(f"Mask 生成完毕。全局 8-bit 比例: {total_8bit/total_params*100:.2f}%", logger='root')
+    #     torch.save(mask_dict, save_path)
+    #     print_log(f"Mask 已保存至: {save_path}", logger='root')
 
     def apply_fine_grained_quantization(self, mask_path, num_tasks=3):
         """

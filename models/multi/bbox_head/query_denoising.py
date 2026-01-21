@@ -121,12 +121,17 @@ class CdnQueryGenerator:
         single_pad = int(max(known_num))  # TODO
 
         pad_size = int(single_pad * 2 * num_groups)
+        
+        # --- FIX 1: 获取当前设备，后续所有新创建的Tensor都对齐这个设备 ---
+        device = boxes.device 
+        
         positive_idx = torch.tensor(range(
-            len(boxes))).long().cuda().unsqueeze(0).repeat(num_groups, 1)
+            len(boxes))).long().to(device).unsqueeze(0).repeat(num_groups, 1)
         positive_idx += (torch.tensor(range(num_groups)) * len(boxes) *
-                         2).long().cuda().unsqueeze(1)
+                         2).long().to(device).unsqueeze(1)
         positive_idx = positive_idx.flatten()
         negative_idx = positive_idx + len(boxes)
+        
         if self.box_noise_scale > 0:
             known_bbox_ = torch.zeros_like(known_bboxs)
             known_bbox_[:, : 2] = \
@@ -144,32 +149,38 @@ class CdnQueryGenerator:
             rand_part = torch.rand_like(known_bboxs)
             rand_part[negative_idx] += 1.0
             rand_part *= rand_sign
+            
+            # --- FIX 2: 移除 .cuda()，避免设备冲突 ---
             known_bbox_ += \
-                torch.mul(rand_part, diff).cuda() * self.box_noise_scale
+                torch.mul(rand_part, diff) * self.box_noise_scale
+            
             known_bbox_ = known_bbox_.clamp(min=0.0, max=1.0)
             known_bbox_expand[:, :2] = \
                 (known_bbox_[:, :2] + known_bbox_[:, 2:]) / 2
             known_bbox_expand[:, 2:] = \
                 known_bbox_[:, 2:] - known_bbox_[:, :2]
 
-        m = known_labels_expand.long().to('cuda')
+        # --- FIX 3: 移除硬编码 'cuda'，改为使用 device ---
+        m = known_labels_expand.long().to(device)
         input_label_embed = label_enc(m)
         input_bbox_embed = inverse_sigmoid(known_bbox_expand, eps=1e-3)
 
-        padding_label = torch.zeros(pad_size, self.hidden_dim).cuda()
-        padding_bbox = torch.zeros(pad_size, 4).cuda()
+        padding_label = torch.zeros(pad_size, self.hidden_dim).to(device)
+        padding_bbox = torch.zeros(pad_size, 4).to(device)
 
         input_query_label = padding_label.repeat(batch_size, 1, 1)
         input_query_bbox = padding_bbox.repeat(batch_size, 1, 1)
 
-        map_known_indice = torch.tensor([]).to('cuda')
+        # --- FIX 4: 移除硬编码 'cuda' ---
+        map_known_indice = torch.tensor([]).to(device)
         if len(known_num):
             map_known_indice = torch.cat(
                 [torch.tensor(range(num)) for num in known_num])
             map_known_indice = torch.cat([
                 map_known_indice + single_pad * i
                 for i in range(2 * num_groups)
-            ]).long()
+            ]).long().to(device) # 确保这里的计算结果也在正确设备上
+            
         if len(known_bid):
             input_query_label[(known_bid.long(),
                                map_known_indice)] = input_label_embed
@@ -177,7 +188,9 @@ class CdnQueryGenerator:
                               map_known_indice)] = input_bbox_embed
 
         tgt_size = pad_size + self.num_queries
-        attn_mask = torch.ones(tgt_size, tgt_size).to('cuda') < 0
+        # --- FIX 5: 移除硬编码 'cuda' ---
+        attn_mask = torch.ones(tgt_size, tgt_size).to(device) < 0
+        
         # match query cannot see the reconstruct
         attn_mask[pad_size:, :pad_size] = True
         # reconstruct cannot see each other

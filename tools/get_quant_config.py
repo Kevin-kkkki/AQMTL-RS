@@ -83,14 +83,14 @@ def main():
         model.apply_mixed_precision_quantization(
             data_loader=calib_loader, 
             num_tasks=3, 
-            ratio_8bit=0.5,  # 必须与你训练时设置的比例一致！
+            ratio_8bit=0.05,  # 必须与你训练时设置的比例一致！
             default_task=target_task
         )
     elif hasattr(model, 'module'):
         model.module.apply_mixed_precision_quantization(
             data_loader=calib_loader, 
             num_tasks=3, 
-            ratio_8bit=0.5,
+            ratio_8bit=0.05,
             default_task=target_task
         )
     
